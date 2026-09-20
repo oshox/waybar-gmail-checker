@@ -1,0 +1,23 @@
+// Add "custom/gmail" to modules-right (or wherever you like) in
+// ~/.config/waybar/config.jsonc, and merge this block into your
+// top-level module config. install.sh does this automatically.
+//
+// - interval: how often waybar re-runs `status`. This is the ONLY thing
+//   that controls polling cadence -- there is no setting inside
+//   waybar-gmail itself for it (see src/config.zig).
+// - signal: fired by every mark-read/archive/trash action and by a
+//   completed `auth` run, so the count updates immediately instead of
+//   waiting for the next interval. Must match the SIGRTMIN+N used in
+//   `pkill -RTMIN+9 waybar` calls elsewhere (install.sh keeps these in
+//   sync automatically; if you assign this signal number to a different
+//   module too, both will refresh together, which is harmless).
+"custom/gmail": {
+  "format": "  {}",
+  "return-type": "json",
+  "interval": 60,
+  "signal": 9,
+  "exec": "$HOME/.local/bin/waybar-gmail status",
+  "on-click": "$HOME/.local/bin/waybar-gmail click",
+  "on-click-right": "$HOME/.local/bin/waybar-gmail open",
+  "tooltip": true,
+},

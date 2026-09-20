@@ -15,6 +15,7 @@ const config = @import("config.zig");
 const secrets = @import("secrets.zig");
 const gmail = @import("gmail.zig");
 const oauth = @import("oauth.zig");
+const status = @import("status.zig");
 
 comptime {
     _ = mime;
@@ -24,6 +25,7 @@ comptime {
     _ = secrets;
     _ = gmail;
     _ = oauth;
+    _ = status;
 }
 
 const Subcommand = enum {
@@ -73,51 +75,22 @@ pub fn main(init: std.process.Init) u8 {
 
     switch (sub) {
         .auth => return cmdAuth(init),
-        // Implemented in later milestones (M3: status, M4: click, M5:
-        // popup/action, M6: open). Each currently reports "not yet
-        // implemented" rather than doing nothing silently.
-        .status, .click, .popup, .action, .open => {
+        .status => return status.run(init),
+        // Implemented in later milestones (M4: click, M5: popup/action,
+        // M6: open). Each currently reports "not yet implemented" rather
+        // than doing nothing silently.
+        .click, .popup, .action, .open => {
             std.debug.print("waybar-gmail: '{s}' is not implemented yet\n", .{sub_arg});
             return 1;
         },
     }
 }
 
-/// Opens (creating if necessary) both of the app's directories: config
-/// (~/.config/waybar-gmail, holds client_secret.json and config.json) and
-/// state ($XDG_RUNTIME_DIR/waybar-gmail, holds the access-token cache).
-const Dirs = struct {
-    config_dir: std.Io.Dir,
-    config_path: []u8,
-    state_dir: std.Io.Dir,
-    state_path: []u8,
-
-    fn deinit(self: *Dirs, gpa: std.mem.Allocator, io: std.Io) void {
-        self.config_dir.close(io);
-        gpa.free(self.config_path);
-        self.state_dir.close(io);
-        gpa.free(self.state_path);
-    }
-};
-
-fn openDirs(gpa: std.mem.Allocator, io: std.Io, environ_map: *const std.process.Environ.Map) !Dirs {
-    const config_path = try config.configDirPath(gpa, environ_map.get("HOME"));
-    errdefer gpa.free(config_path);
-    var config_dir = try cache.openOrCreateAppDir(io, config_path);
-    errdefer config_dir.close(io);
-
-    const state_path = try cache.runtimeDirPath(gpa, environ_map.get("XDG_RUNTIME_DIR"));
-    errdefer gpa.free(state_path);
-    const state_dir = try cache.openOrCreateAppDir(io, state_path);
-
-    return .{ .config_dir = config_dir, .config_path = config_path, .state_dir = state_dir, .state_path = state_path };
-}
-
 fn cmdAuth(init: std.process.Init) u8 {
     const gpa = init.gpa;
     const io = init.io;
 
-    var dirs = openDirs(gpa, io, init.environ_map) catch |err| {
+    var dirs = config.openDirs(gpa, io, init.environ_map) catch |err| {
         std.debug.print("waybar-gmail: can't set up config/state directories: {t}\n", .{err});
         return 1;
     };

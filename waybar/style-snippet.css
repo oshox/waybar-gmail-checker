@@ -1,0 +1,32 @@
+/* Merge into ~/.config/waybar/style.css (install.sh does this
+ * automatically). Uses the same @define-color palette already defined at
+ * the top of that file. */
+
+#custom-gmail {
+    padding: 0 10px;
+    color: @foreground;
+    background-color: @color0; /* matches #custom-weather's neutral tone */
+}
+
+/* Unread mail: the one state that should actually catch your eye, so it
+ * gets the same alert color used for battery.critical / network.disconnected
+ * elsewhere in this file. */
+#custom-gmail.unread {
+    background-color: @color9;
+    color: @foreground;
+}
+
+/* Inbox zero: quietly neutral, nothing to draw attention to. */
+#custom-gmail.read {
+    background-color: @color0;
+    color: @foreground;
+}
+
+/* Something's wrong (network/API error, or never authenticated) -- a
+ * different tone from .unread so "you have mail" and "something's broken"
+ * are never visually confused with each other. */
+#custom-gmail.error,
+#custom-gmail.unauthenticated {
+    background-color: @color3;
+    color: @background;
+}

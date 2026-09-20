@@ -20,6 +20,39 @@ pub fn configDirPath(gpa: Allocator, home: ?[]const u8) error{ OutOfMemory, NoHo
     return Dir.path.join(gpa, &.{ base, ".config", "waybar-gmail" }) catch return error.OutOfMemory;
 }
 
+/// Both of the app's directories, opened (and created if necessary):
+/// config (~/.config/waybar-gmail, holds client_secret.json and
+/// config.json) and state ($XDG_RUNTIME_DIR/waybar-gmail, holds the
+/// access-token and tooltip caches). Every subcommand that touches disk
+/// or the network starts by calling `openDirs`.
+pub const Dirs = struct {
+    config_dir: Dir,
+    config_path: []u8,
+    state_dir: Dir,
+    state_path: []u8,
+
+    pub fn deinit(self: *Dirs, gpa: Allocator, io: Io) void {
+        self.config_dir.close(io);
+        gpa.free(self.config_path);
+        self.state_dir.close(io);
+        gpa.free(self.state_path);
+        self.* = undefined;
+    }
+};
+
+pub fn openDirs(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.Map) !Dirs {
+    const config_path = try configDirPath(gpa, environ_map.get("HOME"));
+    errdefer gpa.free(config_path);
+    var config_dir = try cache.openOrCreateAppDir(io, config_path);
+    errdefer config_dir.close(io);
+
+    const state_path = try cache.runtimeDirPath(gpa, environ_map.get("XDG_RUNTIME_DIR"));
+    errdefer gpa.free(state_path);
+    const state_dir = try cache.openOrCreateAppDir(io, state_path);
+
+    return .{ .config_dir = config_dir, .config_path = config_path, .state_dir = state_dir, .state_path = state_path };
+}
+
 pub const Config = struct {
     /// How many unread messages the popup fetches previews for.
     max_messages: u32 = 15,
