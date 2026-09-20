@@ -1,0 +1,16 @@
+# Google OAuth client credentials — never commit these
+client_secret_*.json
+*.json.bak
+
+# Our own runtime config / secrets
+config.json
+*.token
+fixtures/live-*
+
+# Zig build artifacts
+zig-out/
+.zig-cache/
+
+# Editor/OS noise
+*.swp
+.DS_Store
