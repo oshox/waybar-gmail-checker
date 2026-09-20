@@ -436,14 +436,25 @@ fn respondHtml(io: Io, stream: *Io.net.Stream, message: []const u8) !void {
     writer.interface.flush() catch {};
 }
 
-fn openInBrowser(io: Io, url: []const u8) !void {
-    var child = try std.process.spawn(io, .{
+/// Shared with click.zig (double-click -> open inbox) and, eventually,
+/// the `open` subcommand (M6) -- there's exactly one way this project
+/// opens a URL, so it lives here rather than being duplicated per caller.
+///
+/// Deliberately fire-and-forget: `xdg-open` can take a long time to return
+/// (confirmed empirically on this system -- tens of seconds, apparently
+/// depending on mime-association/D-Bus lookups), which is fine for it but
+/// not for us. `click`'s whole point is to feel instant, and even
+/// `runConsentFlow`'s one-time interactive use shouldn't hang on this when
+/// it already prints the URL as a fallback regardless. Once spawned, the
+/// child is reparented to init and reaped normally; we don't need its exit
+/// status.
+pub fn openInBrowser(io: Io, url: []const u8) !void {
+    _ = try std.process.spawn(io, .{
         .argv = &.{ "xdg-open", url },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    _ = try child.wait(io);
 }
 
 // ---- tests ----

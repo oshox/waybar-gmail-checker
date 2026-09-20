@@ -126,6 +126,24 @@ Small, easy to trip over, listed here so they're not re-discovered the hard way:
 - `Io.Timestamp.now(io, .real).toSeconds()` for a unix timestamp.
 - `std.process.spawn(io, .{ .argv = ..., .stdin = .pipe, .stdout = .pipe, ... }) !Child`, with `child.stdin.?`/`child.stdout.?` as ordinary `Io.File` values (same reader/writer pattern as everything else) and `child.wait(io) !Term`.
 
+## `xdg-open` can block for a long time -- don't wait for it
+
+Not a Zig API issue, but a real bug caught during M4's live testing: the
+initial `openInBrowser` helper (used by both `oauth.runConsentFlow` and
+`click`'s double-click handler) spawned `xdg-open` and called `child.wait(io)`
+on it. On this system that blocked for tens of seconds (observed directly:
+`ps` showed `/usr/bin/sh /usr/bin/xdg-open ...` still running well after the
+browser tab had already opened), apparently down to mime-association/D-Bus
+lookup overhead inside the `xdg-open` shell script itself, not anything
+about the URL or the browser.
+
+`click`'s entire point is to feel instant, so waiting on `xdg-open` is
+never acceptable there, and there's no good reason for `runConsentFlow` to
+wait on it either (the URL is already printed as a fallback regardless).
+Fixed by not waiting at all: spawn and return immediately. The child is
+reparented to init once we exit and reaped normally -- no zombie risk,
+and we don't need its exit status since we can't act on it anyway.
+
 ## Summary of decisions this feeds into M1+
 
 | Area | Decision |

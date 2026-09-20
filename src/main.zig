@@ -16,6 +16,7 @@ const secrets = @import("secrets.zig");
 const gmail = @import("gmail.zig");
 const oauth = @import("oauth.zig");
 const status = @import("status.zig");
+const click = @import("click.zig");
 
 comptime {
     _ = mime;
@@ -26,6 +27,7 @@ comptime {
     _ = gmail;
     _ = oauth;
     _ = status;
+    _ = click;
 }
 
 const Subcommand = enum {
@@ -76,10 +78,11 @@ pub fn main(init: std.process.Init) u8 {
     switch (sub) {
         .auth => return cmdAuth(init),
         .status => return status.run(init),
-        // Implemented in later milestones (M4: click, M5: popup/action,
-        // M6: open). Each currently reports "not yet implemented" rather
-        // than doing nothing silently.
-        .click, .popup, .action, .open => {
+        .click => return click.run(init),
+        // Implemented in later milestones (M5: popup/action, M6: open).
+        // Each currently reports "not yet implemented" rather than doing
+        // nothing silently.
+        .popup, .action, .open => {
             std.debug.print("waybar-gmail: '{s}' is not implemented yet\n", .{sub_arg});
             return 1;
         },
