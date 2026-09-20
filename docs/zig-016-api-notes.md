@@ -144,6 +144,54 @@ Fixed by not waiting at all: spawn and return immediately. The child is
 reparented to init once we exit and reaped normally -- no zombie risk,
 and we don't need its exit status since we can't act on it anyway.
 
+## Two real GTK bugs found building M5's popup, both live-tested to ground
+
+Both found via real crashes while live-testing the popup against fixtures (not
+inferred from reading docs), and both are exactly the class of risk M0/M7
+called out for hand-written GObject signal wiring: a wrong signature or a
+wrong assumption about ordering is silent corruption, not a compile error.
+
+**1. A signal handler and a GClosureNotify look identical at the call site
+but have different parameter orders.** `g_signal_connect_data`'s 3rd
+argument (`c_handler`) and 5th argument (`destroy_data`) are both `void
+(*)(gpointer, gpointer)`-shaped from Zig's perspective (both just
+`?*const anyopaque` once cast), but GLib invokes them differently:
+- a signal handler for e.g. `"destroy"` is called as `(GtkWidget *widget,
+  gpointer user_data)`
+- a `GClosureNotify` (the `destroy_data` parameter) is called as
+  `(gpointer data, GClosure *closure)`
+
+Connecting a cleanup function as the *signal handler* (as this project's
+`destroyAppState` originally was, for `window`'s own `"destroy"` signal)
+while writing it with the *GClosureNotify* signature reads the **widget
+pointer** as if it were the intended `gpointer user_data` -- the first
+parameter is right there, it's just the wrong thing. This produced a
+segfault freeing garbage the first time the window was ever destroyed.
+Fixed by matching the actual shape GLib calls that particular slot with,
+not the shape used elsewhere in the same file for actual GClosureNotify
+destroy_data callbacks.
+
+**2. `GtkWidget::destroy`'s signal handlers all complete *before* the
+container's children are actually torn down -- `G_CONNECT_AFTER` does not
+change this.** The assumption "destroying a container synchronously
+destroys its children first, so a `"destroy"`-signal cleanup handler can
+safely assume the children are already gone" is false: child teardown
+happens later, via GObject's separate dispose/finalize sequence, not
+inside the `"destroy"` signal emission on the parent at all. Confirmed by
+instrumenting both sides with `std.debug.print` of the actual pointer
+values: the parent's `"destroy"` handler ran to completion, then only
+afterward did a child row's own cleanup callback fire and dereference the
+now-freed parent state.
+
+Fixed by not depending on GTK's internal ordering at all: `closePopup`
+explicitly destroys every child row first (each one's cleanup runs
+immediately, while the shared state those callbacks reference is still
+alive), only then destroys the window, and frees that shared state
+directly in Zig code afterward -- no signal-triggered cleanup for it at
+all. This is more deterministic than chasing the "correct" signal/flag
+combination to get GTK's internal ordering to line up, and is easy to
+verify by inspection rather than by trusting undocumented behavior.
+
 ## Summary of decisions this feeds into M1+
 
 | Area | Decision |
@@ -156,3 +204,4 @@ and we don't need its exit status since we can't act on it anyway.
 | Filesystem access | `std.Io.Dir`/`std.Io.File`, not `std.fs`; thread `io` through everywhere |
 | Process entry point | `pub fn main(init: std.process.Init) u8`, using `init.io`/`init.gpa`/`init.minimal.args` |
 | Directory iteration | Avoid entirely (`Dir.iterate`/`walk` hit a confirmed upstream Linux panic); design around predictable filenames instead |
+| GTK "destroy"-adjacent cleanup | Never rely on signal-emission ordering vs. child teardown; tear down explicitly in code instead |

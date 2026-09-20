@@ -79,14 +79,94 @@ pub fn main(init: std.process.Init) u8 {
         .auth => return cmdAuth(init),
         .status => return status.run(init),
         .click => return click.run(init),
-        // Implemented in later milestones (M5: popup/action, M6: open).
-        // Each currently reports "not yet implemented" rather than doing
-        // nothing silently.
-        .popup, .action, .open => {
+        .popup => return cmdPopup(init),
+        .action => return cmdAction(init, &arg_it),
+        // Implemented in M6.
+        .open => {
             std.debug.print("waybar-gmail: '{s}' is not implemented yet\n", .{sub_arg});
             return 1;
         },
     }
+}
+
+/// `waybar-gmail popup` is a convenience alias for running the GTK binary
+/// directly -- it execs into waybar-gmail-popup rather than spawning it,
+/// so this (fully static, zero-GTK) binary never needs to link GTK just
+/// to offer the alias. The real on-click path (click.zig) spawns
+/// waybar-gmail-popup directly and doesn't go through this at all.
+fn cmdPopup(init: std.process.Init) u8 {
+    const err = std.process.replace(init.io, .{ .argv = &.{"waybar-gmail-popup"} });
+    std.debug.print("waybar-gmail: couldn't exec waybar-gmail-popup: {t}\n", .{err});
+    return 1;
+}
+
+const ActionKind = enum { @"mark-read", archive, trash };
+
+const action_usage = "usage: waybar-gmail action <mark-read|archive|trash> <message-id>\n";
+
+fn cmdAction(init: std.process.Init, arg_it: *std.process.Args.Iterator) u8 {
+    const gpa = init.gpa;
+    const io = init.io;
+
+    const action_arg = arg_it.next() orelse {
+        std.debug.print("{s}", .{action_usage});
+        return 2;
+    };
+    const id = arg_it.next() orelse {
+        std.debug.print("{s}", .{action_usage});
+        return 2;
+    };
+    const kind = std.meta.stringToEnum(ActionKind, action_arg) orelse {
+        std.debug.print("waybar-gmail: unknown action '{s}'\n{s}", .{ action_arg, action_usage });
+        return 2;
+    };
+
+    var dirs = config.openDirs(gpa, io, init.environ_map) catch |err| {
+        std.debug.print("waybar-gmail action: can't set up directories: {t}\n", .{err});
+        return 1;
+    };
+    defer dirs.deinit(gpa, io);
+
+    var creds = oauth.loadClientCredentials(gpa, io, dirs.config_dir, "client_secret.json") catch |err| {
+        std.debug.print("waybar-gmail action: can't read client_secret.json: {t}\n", .{err});
+        return 1;
+    };
+    defer creds.deinit(gpa);
+
+    var oauth_http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer oauth_http_client.deinit();
+    const access_token = oauth.getValidAccessToken(gpa, io, &oauth_http_client, creds, dirs.state_dir) catch |err| {
+        std.debug.print("waybar-gmail action: not authenticated: {t}\n", .{err});
+        return 1;
+    };
+    defer gpa.free(access_token);
+
+    var gmail_client = http.Client.initFromEnv(gpa, io, init.environ_map);
+    defer gmail_client.deinit();
+
+    const result = switch (kind) {
+        .@"mark-read" => gmail.markRead(gpa, &gmail_client, access_token, id),
+        .archive => gmail.archive(gpa, &gmail_client, access_token, id),
+        .trash => gmail.trash(gpa, &gmail_client, access_token, id),
+    };
+    result catch |err| {
+        std.debug.print("waybar-gmail action: {s} on {s} failed: {t}\n", .{ action_arg, id, err });
+        return 1;
+    };
+
+    // Best-effort: nudge waybar to refresh the count immediately rather
+    // than waiting for the next poll interval. Note this doesn't update
+    // the structured message/tooltip cache the popup owns (src/popup.zig)
+    // -- a CLI-invoked action is expected to be reconciled by the next
+    // popup open or status poll, not to keep those caches live itself.
+    _ = std.process.spawn(io, .{
+        .argv = &.{ "pkill", "-RTMIN+9", "waybar" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch {};
+
+    return 0;
 }
 
 fn cmdAuth(init: std.process.Init) u8 {
