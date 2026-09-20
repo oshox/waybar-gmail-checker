@@ -1,6 +1,6 @@
-/* Merge into ~/.config/waybar/style.css (install.sh does this
- * automatically). Uses the same @define-color palette already defined at
- * the top of that file. */
+/* Merged into ~/.config/waybar/style.css by install.sh (appended, with a
+ * timestamped backup made first). Uses the same @define-color palette
+ * already defined at the top of that file. */
 
 #custom-gmail {
     padding: 0 10px;

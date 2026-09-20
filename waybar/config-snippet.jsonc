@@ -1,6 +1,9 @@
 // Add "custom/gmail" to modules-right (or wherever you like) in
 // ~/.config/waybar/config.jsonc, and merge this block into your
-// top-level module config. install.sh does this automatically.
+// top-level module config. install.sh prints this snippet and these
+// instructions but does not merge it automatically -- config.jsonc is
+// hand-maintained (comments, specific ordering) and a script splicing
+// JSON into that blindly is more likely to mangle it than help.
 //
 // - interval: how often waybar re-runs `status`. This is the ONLY thing
 //   that controls polling cadence -- there is no setting inside
