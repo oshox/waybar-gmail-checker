@@ -1,0 +1,9 @@
+{"status": 200, "body": {
+  "id": "msg-bad-utf8",
+  "threadId": "thread-bad-utf8",
+  "snippet": "You've won a prize! Click here to claim",
+  "payload": {"headers": [
+    {"name": "From", "value": "\"Prize Notification\" <prizes@example.net>"},
+    {"name": "Subject", "value": "=?UTF-8?B?Q0xBSU0gTk9XIC0g//4gWU9VIFdPTiE=?="}
+  ]}
+}}

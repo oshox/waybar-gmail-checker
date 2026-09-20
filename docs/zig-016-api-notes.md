@@ -113,6 +113,19 @@ Every call path through `Dir.iterate()` + `Iterator.next(io)` hits this, includi
 
 **Resolution: don't use directory iteration.** Nothing in `cache.zig`'s actual functionality needs it -- the only place it showed up was a test asserting "no leftover temp file," which was rewritten to predict the exact temp filename (by exposing the random suffix as a parameter to an internal `atomicWriteWithSuffix`) and check for its absence directly with `readFile`/`FileNotFound`, rather than listing the directory. If a later milestone ever seems to need directory enumeration (none currently planned), re-probe this first rather than assuming it's fixed.
 
+## Miscellaneous API renames found while writing M2
+
+Small, easy to trip over, listed here so they're not re-discovered the hard way:
+
+- `std.process.Child.Term` variants are lowercase now: `.exited`, `.signal`, `.stopped`, `.unknown` (not `.Exited`).
+- `std.mem.trimRight` is gone; it's `std.mem.trimEnd` (and `trimStart`/`trim`).
+- `std.Build.path()` panics on an absolute path (`"is expected to be relative to the build root"`); use `.{ .cwd_relative = "/abs/path" }` as the `LazyPath` instead.
+- `std.http.Client.fetch`'s `method`/`extra_headers`/`payload`/`response_writer` fields work as expected once you're past the `Io` construction (see the M0 probe notes above) -- confirmed again in `http.zig` and `oauth.zig`'s token-endpoint calls.
+- `std.Uri.percentDecodeInPlace(buf)` decodes in place and returns a **shorter** slice of the same buffer. That returned slice cannot be freed on its own -- its length no longer matches the original allocation's, and the debug allocator correctly flags this (`Invalid free`, canary mismatch) if you try. Dupe the decoded result into a fresh allocation before freeing the scratch buffer. The same general lesson applies anywhere a sentinel-terminated allocation (`[:0]u8` from e.g. `Dir.realPathFileAlloc`) gets coerced to a plain slice and stored somewhere it will later be freed from -- free it through its *original* type, or dupe first.
+- `std.Io.net.Socket.address` already holds the real bound address/port after `IpAddress.listen(...)` with port 0 requested -- no `getsockname`-equivalent call needed to discover an ephemeral port.
+- `Io.Timestamp.now(io, .real).toSeconds()` for a unix timestamp.
+- `std.process.spawn(io, .{ .argv = ..., .stdin = .pipe, .stdout = .pipe, ... }) !Child`, with `child.stdin.?`/`child.stdout.?` as ordinary `Io.File` values (same reader/writer pattern as everything else) and `child.wait(io) !Term`.
+
 ## Summary of decisions this feeds into M1+
 
 | Area | Decision |

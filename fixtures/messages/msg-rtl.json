@@ -1,0 +1,9 @@
+{"status": 200, "body": {
+  "id": "msg-rtl",
+  "threadId": "thread-rtl",
+  "snippet": "مرحبا، هذه رسالة تجريبية باللغة العربية",
+  "payload": {"headers": [
+    {"name": "From", "value": "أحمد <ahmed@example.com>"},
+    {"name": "Subject", "value": "دعوة لحضور الاجتماع"}
+  ]}
+}}

@@ -10,10 +10,20 @@ const std = @import("std");
 // exercise their `test` blocks.
 const mime = @import("mime.zig");
 const cache = @import("cache.zig");
+const http = @import("http.zig");
+const config = @import("config.zig");
+const secrets = @import("secrets.zig");
+const gmail = @import("gmail.zig");
+const oauth = @import("oauth.zig");
 
 comptime {
     _ = mime;
     _ = cache;
+    _ = http;
+    _ = config;
+    _ = secrets;
+    _ = gmail;
+    _ = oauth;
 }
 
 const Subcommand = enum {
@@ -62,12 +72,75 @@ pub fn main(init: std.process.Init) u8 {
     };
 
     switch (sub) {
-        // Implemented in later milestones (M2: auth/gmail client, M3:
-        // status, M4: click, M5: popup/action, M6: open). Each currently
-        // reports "not yet implemented" rather than doing nothing silently.
-        .status, .click, .popup, .action, .auth, .open => {
+        .auth => return cmdAuth(init),
+        // Implemented in later milestones (M3: status, M4: click, M5:
+        // popup/action, M6: open). Each currently reports "not yet
+        // implemented" rather than doing nothing silently.
+        .status, .click, .popup, .action, .open => {
             std.debug.print("waybar-gmail: '{s}' is not implemented yet\n", .{sub_arg});
             return 1;
         },
     }
+}
+
+/// Opens (creating if necessary) both of the app's directories: config
+/// (~/.config/waybar-gmail, holds client_secret.json and config.json) and
+/// state ($XDG_RUNTIME_DIR/waybar-gmail, holds the access-token cache).
+const Dirs = struct {
+    config_dir: std.Io.Dir,
+    config_path: []u8,
+    state_dir: std.Io.Dir,
+    state_path: []u8,
+
+    fn deinit(self: *Dirs, gpa: std.mem.Allocator, io: std.Io) void {
+        self.config_dir.close(io);
+        gpa.free(self.config_path);
+        self.state_dir.close(io);
+        gpa.free(self.state_path);
+    }
+};
+
+fn openDirs(gpa: std.mem.Allocator, io: std.Io, environ_map: *const std.process.Environ.Map) !Dirs {
+    const config_path = try config.configDirPath(gpa, environ_map.get("HOME"));
+    errdefer gpa.free(config_path);
+    var config_dir = try cache.openOrCreateAppDir(io, config_path);
+    errdefer config_dir.close(io);
+
+    const state_path = try cache.runtimeDirPath(gpa, environ_map.get("XDG_RUNTIME_DIR"));
+    errdefer gpa.free(state_path);
+    const state_dir = try cache.openOrCreateAppDir(io, state_path);
+
+    return .{ .config_dir = config_dir, .config_path = config_path, .state_dir = state_dir, .state_path = state_path };
+}
+
+fn cmdAuth(init: std.process.Init) u8 {
+    const gpa = init.gpa;
+    const io = init.io;
+
+    var dirs = openDirs(gpa, io, init.environ_map) catch |err| {
+        std.debug.print("waybar-gmail: can't set up config/state directories: {t}\n", .{err});
+        return 1;
+    };
+    defer dirs.deinit(gpa, io);
+
+    var creds = oauth.loadClientCredentials(gpa, io, dirs.config_dir, "client_secret.json") catch |err| {
+        std.debug.print(
+            "waybar-gmail: can't read client_secret.json from {s}: {t}\n" ++
+                "See the README for how to create a Google Cloud OAuth client and place it there.\n",
+            .{ dirs.config_path, err },
+        );
+        return 1;
+    };
+    defer creds.deinit(gpa);
+
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http_client.deinit();
+
+    oauth.runConsentFlow(gpa, io, &http_client, creds, dirs.state_dir) catch |err| {
+        std.debug.print("waybar-gmail: authentication failed: {t}\n", .{err});
+        return 1;
+    };
+
+    std.debug.print("waybar-gmail: authenticated successfully.\n", .{});
+    return 0;
 }

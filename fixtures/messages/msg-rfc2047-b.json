@@ -1,0 +1,9 @@
+{"status": 200, "body": {
+  "id": "msg-rfc2047-b",
+  "threadId": "thread-rfc2047-b",
+  "snippet": "Let's grab coffee and go over the roadmap",
+  "payload": {"headers": [
+    {"name": "From", "value": "=?UTF-8?B?TWFyaWEgR2FyY8OtYQ==?= <maria@example.com>"},
+    {"name": "Subject", "value": "=?UTF-8?B?Q2Fmw6kg4piVIG1lZXRpbmcgbm90ZXM=?="}
+  ]}
+}}

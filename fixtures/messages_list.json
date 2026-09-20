@@ -1,0 +1,10 @@
+{"status": 200, "body": {"messages": [
+  {"id": "msg-plain", "threadId": "thread-plain"},
+  {"id": "msg-rfc2047-b", "threadId": "thread-rfc2047-b"},
+  {"id": "msg-rfc2047-q", "threadId": "thread-rfc2047-q"},
+  {"id": "msg-emoji", "threadId": "thread-emoji"},
+  {"id": "msg-rtl", "threadId": "thread-rtl"},
+  {"id": "msg-long-subject", "threadId": "thread-long-subject"},
+  {"id": "msg-empty-snippet", "threadId": "thread-empty-snippet"},
+  {"id": "msg-bad-utf8", "threadId": "thread-bad-utf8"}
+], "resultSizeEstimate": 8}}

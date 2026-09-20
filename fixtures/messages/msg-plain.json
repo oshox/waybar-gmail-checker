@@ -1,0 +1,9 @@
+{"status": 200, "body": {
+  "id": "msg-plain",
+  "threadId": "thread-plain",
+  "snippet": "Your pull request has been merged into main.",
+  "payload": {"headers": [
+    {"name": "From", "value": "GitHub <notifications@github.com>"},
+    {"name": "Subject", "value": "PR #412 merged: fix double-click race"}
+  ]}
+}}

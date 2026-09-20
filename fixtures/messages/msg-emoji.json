@@ -1,0 +1,9 @@
+{"status": 200, "body": {
+  "id": "msg-emoji",
+  "threadId": "thread-emoji",
+  "snippet": "🎉 We just shipped v2.0! Here's what's new in this release 🚀",
+  "payload": {"headers": [
+    {"name": "From", "value": "Team Notify 👋 <notify@example.com>"},
+    {"name": "Subject", "value": "🚀 v2.0 is live! 🎉"}
+  ]}
+}}

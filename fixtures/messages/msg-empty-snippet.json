@@ -1,0 +1,9 @@
+{"status": 200, "body": {
+  "id": "msg-empty-snippet",
+  "threadId": "thread-empty-snippet",
+  "snippet": "",
+  "payload": {"headers": [
+    {"name": "From", "value": "AWS Budgets <no-reply@budgets.amazonaws.com>"},
+    {"name": "Subject", "value": "Budget Alert: You have exceeded your budget"}
+  ]}
+}}
