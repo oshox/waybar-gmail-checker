@@ -80,6 +80,39 @@ mod.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .yes });
 const exe = b.addExecutable(.{ .name = "...", .root_module = mod });
 ```
 
+## `std.fs.Dir` moved to `std.Io.Dir` -- every operation now takes an `io: Io`
+
+Confirmed while writing M1's `cache.zig`. `std.fs` is now a thin, mostly-deprecated shim (`fs.zig` is ~16 lines); the real type is `std.Io.Dir`, and essentially every method (`createFile`, `openFile`, `rename`, `deleteFile`, `stat`, `createDirPathOpen`, `iterate`, ...) takes an `io: Io` parameter alongside `self`. Likewise `std.fs.File` doesn't exist -- it's `std.Io.File`, with `.stdout()`/`.stderr()`/`.stdin()` and a `writer(io, buffer)` that also needs `io`. `std.debug.print` still needs no `Io` from the caller (it manages stderr access internally), so it's the right choice for simple CLI usage/error output that happens before any real I/O setup.
+
+`Dir.Permissions` is `enum(std.posix.mode_t) { default_file = 0o666, default_dir = 0o777, _, }` with `.fromMode(0o600)` to build an arbitrary mode -- used throughout for the "0600 on every private file" requirement.
+
+## New `pub fn main(init: std.process.Init) ...` entry-point convention
+
+0.16 added an alternative main signature the runtime detects via `@typeInfo`: `pub fn main(init: std.process.Init) u8` (or `!void`, etc.). `init` bundles:
+
+- `init.io: Io` -- a ready `Io.Threaded` instance, so subcommands never need to construct their own.
+- `init.gpa: Allocator` -- **automatically leak-checked in debug builds**. This satisfies M7's "every subcommand runs under a leak-detecting allocator" requirement for free, with no extra wiring.
+- `init.arena: *std.heap.ArenaAllocator` -- process-lifetime scratch allocator.
+- `init.minimal.args: std.process.Args` -- `args.iterate()` gives an `Iterator` with `.next() ?[:0]const u8` (Linux path needs no allocator).
+- `init.environ_map: *Environ.Map` -- parsed environment.
+
+`src/main.zig` and `src/popup_main.zig` both use this convention now instead of the old plain `fn main() u8` + manually reading `std.os.argv`/env.
+
+## Confirmed upstream bug: `Dir.iterate()` / `dirReadLinux` panics on Linux
+
+Found while testing `cache.zig`'s atomic-write cleanup, then reproduced in complete isolation (a freshly created, otherwise-untouched directory, zero prior operations on it) and independently corroborated by other projects hitting the identical panic (`ziyle` `sigil` project's CI, `chung-leong/zigar` issue #1081 hitting the same `errnoBug`/BADF pattern from a different call site) -- this is a real regression in `std.Io.Threaded`'s Linux directory-reading path, not anything specific to our usage:
+
+```
+thread N panic: programmer bug caused syscall error: BADF
+.../std/Io/Threaded.zig: posixSeekTo(dr.dir.handle, 0) catch |err| switch (err) {
+.../std/Io/Threaded.zig: dirReadLinux
+.../std/Io/Dir.zig: Reader.read -> Iterator.next
+```
+
+Every call path through `Dir.iterate()` + `Iterator.next(io)` hits this, including the simplest possible case (`var it = dir.iterate(); try it.next(io);` on an empty dir, no prior writes). `Dir.walk`/`walkSelectively` are built on the same reader and are presumably equally affected (not independently verified here, since nothing in this project needs them).
+
+**Resolution: don't use directory iteration.** Nothing in `cache.zig`'s actual functionality needs it -- the only place it showed up was a test asserting "no leftover temp file," which was rewritten to predict the exact temp filename (by exposing the random suffix as a parameter to an internal `atomicWriteWithSuffix`) and check for its absence directly with `readFile`/`FileNotFound`, rather than listing the directory. If a later milestone ever seems to need directory enumeration (none currently planned), re-probe this first rather than assuming it's fixed.
+
 ## Summary of decisions this feeds into M1+
 
 | Area | Decision |
@@ -89,3 +122,6 @@ const exe = b.addExecutable(.{ .name = "...", .root_module = mod });
 | TLS session resumption | Not available; M7 documents the ~1400 full-handshakes/day cost honestly |
 | Fuzzing | `-ffuzz` available; use for M7 |
 | GTK/layer-shell bindings | Hand-declared `extern` in `src/c.zig`, not `@cImport` |
+| Filesystem access | `std.Io.Dir`/`std.Io.File`, not `std.fs`; thread `io` through everywhere |
+| Process entry point | `pub fn main(init: std.process.Init) u8`, using `init.io`/`init.gpa`/`init.minimal.args` |
+| Directory iteration | Avoid entirely (`Dir.iterate`/`walk` hit a confirmed upstream Linux panic); design around predictable filenames instead |

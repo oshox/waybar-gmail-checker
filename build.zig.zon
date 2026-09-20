@@ -1,0 +1,11 @@
+.{
+    .name = .waybar_gmail_checker,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xc8dcabba70245324,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
