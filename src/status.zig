@@ -141,8 +141,15 @@ pub fn run(init: std.process.Init) u8 {
     const gpa = init.gpa;
     const io = init.io;
 
+    // .writerStreaming, not .writer: the latter assumes a seekable regular
+    // file and issues a positional pwritev first, which (confirmed via
+    // strace) fails with ESPIPE against a pipe -- which is exactly what
+    // stdout is when waybar runs this -- and falls back to a second,
+    // ordinary writev. That's a wasted failing syscall on every single
+    // poll, 1440 times a day; writerStreaming goes straight to the
+    // ordinary write path with no positional attempt.
     var stdout_buf: [8192]u8 = undefined;
-    var stdout_writer = Io.File.stdout().writer(io, &stdout_buf);
+    var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buf);
     const w = &stdout_writer.interface;
 
     var dirs = config.openDirs(gpa, io, init.environ_map) catch |err| {
@@ -171,7 +178,7 @@ pub fn run(init: std.process.Init) u8 {
         }
         return 0;
     };
-    defer gpa.free(access_token);
+    defer oauth.secureFree(gpa, access_token);
 
     var gmail_client = http.Client.initFromEnv(gpa, io, init.environ_map);
     defer gmail_client.deinit();

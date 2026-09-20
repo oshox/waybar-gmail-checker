@@ -78,7 +78,7 @@ const AppState = struct {
     fn deinit(self: *AppState) void {
         for (self.messages.items) |*m| m.deinit(self.gpa);
         self.messages.deinit(self.gpa);
-        self.gpa.free(self.access_token);
+        oauth.secureFree(self.gpa, self.access_token);
         self.creds.deinit(self.gpa);
         self.config_dir.close(self.io);
         self.state_dir.close(self.io);
@@ -151,12 +151,20 @@ fn persistCaches(app: *AppState) void {
 }
 
 fn notifyWaybar(io: Io) void {
-    _ = std.process.spawn(io, .{
+    // Unlike the fire-and-forget xdg-open/popup spawns elsewhere in this
+    // project (safe because the *spawning* process there exits within
+    // milliseconds, so init reparents and reaps the child almost
+    // immediately), the popup is long-lived and calls this once per
+    // action -- several unreaped children in one popup session would
+    // accumulate as zombies until the popup itself finally exits. Wait on
+    // it; pkill returns essentially instantly either way.
+    var child = std.process.spawn(io, .{
         .argv = &.{ "pkill", "-RTMIN+9", "waybar" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-    }) catch {};
+    }) catch return;
+    _ = child.wait(io) catch {};
 }
 
 // ---- fetching ----
@@ -512,7 +520,7 @@ fn setupAppState(init_data: std.process.Init, gtk_app: *c.GtkApplication) !*AppS
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
     const access_token = try oauth.getValidAccessToken(gpa, io, &http_client, creds, dirs.state_dir);
-    errdefer gpa.free(access_token);
+    errdefer oauth.secureFree(gpa, access_token);
 
     const app = try gpa.create(AppState);
 
@@ -613,5 +621,11 @@ pub fn run(init: std.process.Init) u8 {
     _ = c.g_signal_connect_data(gtk_app, "activate", @ptrCast(&onActivate), @constCast(&init), null, 0);
 
     const status_code = c.g_application_run(@ptrCast(gtk_app), 0, null);
-    return @intCast(status_code);
+    // g_application_run's c_int return is conventionally a small
+    // non-negative exit code, but that's GLib's convention, not a
+    // documented guarantee -- a raw @intCast to u8 would panic on
+    // anything outside 0-255, which would be an avoidable crash on this
+    // program's very last line. std.math.cast fails safely to null
+    // instead, mapped to a generic non-zero exit code.
+    return std.math.cast(u8, status_code) orelse 1;
 }

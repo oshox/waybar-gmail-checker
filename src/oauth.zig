@@ -177,6 +177,18 @@ pub fn extractQueryParam(gpa: Allocator, target: []const u8, key: []const u8) !?
     return try gpa.dupe(u8, decoded);
 }
 
+/// Zeroes a secret buffer (access or refresh token) before freeing it.
+/// Worth doing even though the memory is about to be unmapped: the
+/// shipped build (ReleaseSmall, via install.sh) doesn't use
+/// std.heap.DebugAllocator, so there's no free-poisoning safety net
+/// scrubbing it automatically the way there is in debug/test builds --
+/// without this, a live bearer credential could sit readable in freed
+/// heap pages until something else happens to overwrite them.
+pub fn secureFree(gpa: Allocator, secret: []u8) void {
+    std.crypto.secureZero(u8, secret);
+    gpa.free(secret);
+}
+
 // ---- Token cache (access token + expiry only; refresh token lives in the keyring) ----
 
 pub const CachedToken = struct {
@@ -184,7 +196,7 @@ pub const CachedToken = struct {
     expires_at: i64,
 
     pub fn deinit(self: *CachedToken, gpa: Allocator) void {
-        gpa.free(self.access_token);
+        secureFree(gpa, self.access_token);
         self.* = undefined;
     }
 };
@@ -232,8 +244,8 @@ pub const TokenResponse = struct {
     expires_in: i64,
 
     pub fn deinit(self: *TokenResponse, gpa: Allocator) void {
-        gpa.free(self.access_token);
-        if (self.refresh_token) |rt| gpa.free(rt);
+        secureFree(gpa, self.access_token);
+        if (self.refresh_token) |rt| secureFree(gpa, rt);
         self.* = undefined;
     }
 };
@@ -338,7 +350,7 @@ pub fn getValidAccessToken(
 
     const refresh_token = (try secrets.lookup(gpa, io, secret_service, secret_account)) orelse
         return error.NotAuthenticated;
-    defer gpa.free(refresh_token);
+    defer secureFree(gpa, refresh_token);
 
     var tokens = try refreshAccessToken(gpa, http_client, creds, refresh_token);
     defer tokens.deinit(gpa);

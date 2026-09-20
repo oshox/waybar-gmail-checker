@@ -139,7 +139,7 @@ fn cmdAction(init: std.process.Init, arg_it: *std.process.Args.Iterator) u8 {
         std.debug.print("waybar-gmail action: not authenticated: {t}\n", .{err});
         return 1;
     };
-    defer gpa.free(access_token);
+    defer oauth.secureFree(gpa, access_token);
 
     var gmail_client = http.Client.initFromEnv(gpa, io, init.environ_map);
     defer gmail_client.deinit();

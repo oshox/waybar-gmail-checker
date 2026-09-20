@@ -14,3 +14,7 @@ zig-out/
 # Editor/OS noise
 *.swp
 .DS_Store
+
+# Core dumps (e.g. from a debugging session under valgrind)
+vgcore.*
+core.*

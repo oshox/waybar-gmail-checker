@@ -360,3 +360,53 @@ test "already-valid UTF-8 with non-ASCII literal text is untouched" {
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("日本語 テスト", got);
 }
+
+// ---- randomized stress test (M7) ----
+//
+// decodeHeader's whole job is parsing attacker-influenced input (email
+// headers), so it's worth more than hand-picked edge cases. This generates
+// a large number of random byte strings -- weighted toward the specific
+// bytes that actually matter to the parser ('=', '?', '_', high-bit bytes)
+// rather than uniform noise, since uniform random bytes essentially never
+// produce anything that even looks like "=?...?=" -- and checks the two
+// invariants the module's own doc comment promises: it never returns an
+// error other than OutOfMemory (so a panic or an unexpected error variant
+// both fail the test), and the result is always valid UTF-8 no matter how
+// garbled the input.
+//
+// A fixed seed keeps this reproducible; deliberately not std.testing.fuzz
+// (Zig 0.16's coverage-guided harness) since a fixed, large iteration count
+// over a hand-biased alphabet already exercises every branch in a decoder
+// this size (confirmed by also running with several different seeds during
+// development, all clean) with a much smaller surface to get wrong for the
+// gain involved here.
+test "decodeHeader never crashes and always produces valid UTF-8 on random input" {
+    var prng = std.Random.DefaultPrng.init(0x6d696d65); // "mime" as inspiration, not cryptographic
+    const random = prng.random();
+
+    // Heavily biased toward the bytes the parser actually branches on, so
+    // random strings actually land inside/near encoded-word syntax instead
+    // of being uniformly-distributed noise that's always trivially literal.
+    const alphabet = "=?BbQq_0123456789ABCDEFabcdefUTF-8ISOso-8859-1 \t\r\n\"<>[]" ++ "\xff\xfe\x80\x81\xc0\xe0\xf0";
+
+    var iteration: usize = 0;
+    while (iteration < 20_000) : (iteration += 1) {
+        const len = random.intRangeAtMost(usize, 0, 96);
+        var buf: [96]u8 = undefined;
+        for (buf[0..len]) |*b| {
+            b.* = alphabet[random.intRangeLessThan(usize, 0, alphabet.len)];
+        }
+        const input = buf[0..len];
+
+        const got = decodeHeader(testing.allocator, input) catch |err| {
+            std.debug.print("decodeHeader returned an error on iteration {d}, input: {any}\n", .{ iteration, input });
+            return err;
+        };
+        defer testing.allocator.free(got);
+
+        if (!std.unicode.utf8ValidateSlice(got)) {
+            std.debug.print("decodeHeader produced invalid UTF-8 on iteration {d}\n  input:  {any}\n  output: {any}\n", .{ iteration, input, got });
+            return error.InvalidUtf8Produced;
+        }
+    }
+}
