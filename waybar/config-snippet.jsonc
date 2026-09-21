@@ -15,7 +15,7 @@
 //   sync automatically; if you assign this signal number to a different
 //   module too, both will refresh together, which is harmless).
 "custom/gmail": {
-  "format": "  {}",
+  "format": " {}",
   "return-type": "json",
   "interval": 60,
   "signal": 9,

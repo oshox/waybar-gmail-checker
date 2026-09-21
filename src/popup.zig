@@ -169,31 +169,51 @@ fn notifyWaybar(io: Io) void {
 
 // ---- fetching ----
 
-fn fetchMessages(app: *AppState) ![]CachedMessage {
+/// Fetches the unread list, then adds one row at a time as each
+/// message's preview arrives, pumping the main loop after each -- rather
+/// than building the whole list off-screen and swapping it in once
+/// everything is ready. Both take the same total time (this project has
+/// no threads; every preview is still a separate sequential blocking
+/// call), but the previous all-at-once version left the window visibly
+/// frozen for that whole stretch, which live testing reported as the
+/// popup being slow to appear/respond. Rows appearing progressively, and
+/// the loop staying responsive (Escape, scrolling) between them, reads
+/// as "working" instead of "stuck" for the exact same wall-clock cost.
+fn refreshMessagesIncremental(app: *AppState) !void {
     var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
     defer client.deinit();
 
     const refs = try gmail.listUnread(app.gpa, &client, app.access_token, 15);
     defer gmail.freeMessageRefs(app.gpa, refs);
 
-    var out: std.ArrayList(CachedMessage) = .empty;
-    errdefer {
-        for (out.items) |*m| m.deinit(app.gpa);
-        out.deinit(app.gpa);
-    }
+    // Only replace what's on screen once we know the real list -- on
+    // error above, whatever cache/previous content was showing is left
+    // untouched. The count is shown immediately, ahead of any preview.
+    for (app.messages.items) |*m| m.deinit(app.gpa);
+    app.messages.clearRetainingCapacity();
+    clearListBox(app);
+    updateHeaderForCount(app, refs.len);
 
     for (refs) |ref| {
         var preview = gmail.getPreview(app.gpa, &client, app.access_token, ref.id) catch continue;
         defer preview.deinit(app.gpa);
-        try out.append(app.gpa, .{
+        try app.messages.append(app.gpa, .{
             .id = try app.gpa.dupe(u8, ref.id),
             .thread_id = try app.gpa.dupe(u8, ref.thread_id),
             .from = try app.gpa.dupe(u8, preview.from),
             .subject = try app.gpa.dupe(u8, preview.subject),
             .snippet = try app.gpa.dupe(u8, preview.snippet),
         });
+
+        const msg_ptr = &app.messages.items[app.messages.items.len - 1];
+        const row = buildRow(app, msg_ptr) catch continue;
+        msg_ptr.row = row;
+        c.gtk_container_add(@ptrCast(app.list_box), row);
+        c.gtk_widget_show_all(row);
+        while (c.gtk_events_pending() != 0) _ = c.gtk_main_iteration();
     }
-    return out.toOwnedSlice(app.gpa);
+
+    persistCaches(app);
 }
 
 // ---- UI construction ----
@@ -346,16 +366,20 @@ fn updateHeader(app: *AppState, text: []const u8) void {
     c.gtk_label_set_markup(@ptrCast(app.header_label), markup);
 }
 
-fn updateHeaderCount(app: *AppState) void {
-    switch (app.messages.items.len) {
+fn updateHeaderForCount(app: *AppState, count: usize) void {
+    switch (count) {
         0 => updateHeader(app, "Gmail — Inbox zero"),
         1 => updateHeader(app, "Gmail — 1 unread"),
         else => {
-            const text = std.fmt.allocPrint(app.gpa, "Gmail — {d} unread", .{app.messages.items.len}) catch return;
+            const text = std.fmt.allocPrint(app.gpa, "Gmail — {d} unread", .{count}) catch return;
             defer app.gpa.free(text);
             updateHeader(app, text);
         },
     }
+}
+
+fn updateHeaderCount(app: *AppState) void {
+    updateHeaderForCount(app, app.messages.items.len);
 }
 
 /// Destroys every row widget currently in the list box (each one's
@@ -399,8 +423,14 @@ fn findMessageIndex(app: *AppState, message_id: []const u8) ?usize {
 fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void {
     const idx = findMessageIndex(app, message_id) orelse return;
 
-    // Optimistic: remove from the UI immediately.
+    // Optimistic: remove from the UI immediately. Destroying it isn't
+    // enough on its own -- GTK doesn't actually repaint until control
+    // returns to the main loop, and the network call below blocks this
+    // same (only) thread for the duration of the request. Without
+    // pumping the loop here, the row stayed visible for the entire
+    // round trip, which live testing surfaced as "doesn't get removed".
     if (app.messages.items[idx].row) |row| c.gtk_widget_destroy(row);
+    while (c.gtk_events_pending() != 0) _ = c.gtk_main_iteration();
 
     var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
     defer client.deinit();
@@ -447,17 +477,9 @@ fn refreshTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
     oauth.secureFree(app.gpa, app.access_token);
     app.access_token = new_token;
 
-    const fetched = fetchMessages(app) catch |err| {
+    refreshMessagesIncremental(app) catch |err| {
         std.debug.print("waybar-gmail-popup: refresh failed: {t}\n", .{err});
-        return 0; // G_SOURCE_REMOVE -- keep whatever was already shown (cache or empty)
     };
-
-    for (app.messages.items) |*m| m.deinit(app.gpa);
-    app.messages.deinit(app.gpa);
-    app.messages = .fromOwnedSlice(fetched);
-
-    populateListFromMessages(app);
-    persistCaches(app);
     return 0; // G_SOURCE_REMOVE: one-shot
 }
 
@@ -567,7 +589,13 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
     const window: *c.GtkWindow = @ptrCast(window_widget);
     app.window = window;
     c.gtk_window_set_title(window, "Gmail");
-    c.gtk_window_set_default_size(window, 360, 400);
+    // Deliberately no gtk_window_set_default_size: that sets the size
+    // the window opens at regardless of content, which forced 400px of
+    // height (mostly blank) even with zero or one message. Fixing the
+    // width but leaving height at -1 (natural) lets the window's actual
+    // size come from its children -- header + however tall the list
+    // ends up being, capped by gtk_scrolled_window_set_max_content_height
+    // below.
     c.gtk_widget_set_size_request(window_widget, 360, -1);
 
     c.gtk_layer_init_for_window(window);
@@ -592,7 +620,11 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
     c.gtk_box_pack_start(outer, header_widget, 0, 0, 0);
 
     const scrolled_widget = c.gtk_scrolled_window_new(null, null);
-    c.gtk_widget_set_size_request(scrolled_widget, -1, 340);
+    // Size to content up to 340px, rather than always claiming 340px --
+    // the fixed size_request this replaced left a block of empty space
+    // below the list whenever there were fewer than ~3 messages.
+    c.gtk_scrolled_window_set_propagate_natural_height(scrolled_widget, 1);
+    c.gtk_scrolled_window_set_max_content_height(scrolled_widget, 340);
     const list_box_widget = c.gtk_list_box_new();
     app.list_box = list_box_widget;
     c.gtk_container_add(@ptrCast(scrolled_widget), list_box_widget);
