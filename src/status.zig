@@ -78,13 +78,16 @@ fn loadTooltipLines(gpa: Allocator, io: Io, dir: Dir) ?[][]u8 {
 
 // ---- JSON status line ----
 
-/// Escapes text for use as Pango markup -- needed for the popup's GTK
-/// labels (popup.zig calls this before gtk_label_set_markup), which
-/// genuinely do render Pango markup. NOT used for the waybar tooltip
-/// below: confirmed live (a real bug, not a hedge) that waybar's
-/// custom-module tooltips render as plain text, not markup -- escaping
-/// them here just means the user sees literal "&lt;"/"&gt;" text in
-/// every "Name <address>"-shaped From header instead of "<"/">".
+/// Escapes text for use as Pango markup. Needed both for the popup's GTK
+/// labels (popup.zig, before gtk_label_set_markup) and for the waybar
+/// tooltip below: confirmed live, the hard way, that waybar's
+/// custom-module tooltip *does* parse its text as Pango markup here (an
+/// earlier version of this comment claimed otherwise based on old GitHub
+/// issues describing a different waybar version/symptom -- that was
+/// wrong, and trusting it over direct verification produced a real
+/// regression: unescaped "<address>" text is invalid markup, which GTK
+/// fails to parse and renders as an empty tooltip rather than falling
+/// back to showing it as plain text).
 pub fn escapePango(gpa: Allocator, text: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -103,9 +106,9 @@ pub fn escapePango(gpa: Allocator, text: []const u8) Allocator.Error![]u8 {
 /// "tooltip","class"}`. `text` is the module's visible label (typically
 /// the unread count, or "" to self-hide per `hide-empty-text`); `class`
 /// drives waybar CSS (`#custom-gmail.unread` etc.); `tooltip_lines` are
-/// joined with newlines as plain text -- waybar's custom-module tooltips
-/// don't render Pango markup, so no escaping here (see escapePango's own
-/// comment for the popup, where it's a different, real rendering context).
+/// joined with newlines and Pango-escaped -- the tooltip is markup, and
+/// unescaped "<"/"&" from a "Name <address>"-shaped From header is
+/// otherwise invalid markup that fails to parse (see escapePango).
 pub fn buildStatusJson(
     gpa: Allocator,
     writer: *Io.Writer,
@@ -117,7 +120,9 @@ pub fn buildStatusJson(
     defer tooltip.deinit(gpa);
     for (tooltip_lines, 0..) |line, i| {
         if (i != 0) try tooltip.append(gpa, '\n');
-        try tooltip.appendSlice(gpa, line);
+        const escaped = try escapePango(gpa, line);
+        defer gpa.free(escaped);
+        try tooltip.appendSlice(gpa, escaped);
     }
 
     const class_str = @tagName(class);
@@ -277,20 +282,22 @@ test "buildStatusJson joins multiple tooltip lines with newlines" {
     try testing.expectEqualStrings("GitHub — PR merged\nStripe — Invoice ready", parsed.value.object.get("tooltip").?.string);
 }
 
-test "buildStatusJson leaves tooltip lines as plain text, unescaped" {
-    // Confirmed live: waybar's custom-module tooltips render as plain
-    // text, not Pango markup (unlike the popup's GTK labels, which
-    // genuinely do use markup -- see escapePango). Escaping here would
-    // make every "Name <address>"-shaped From header show up with
-    // literal "&lt;"/"&gt;" text in the tooltip, which is exactly the
-    // bug this guards against regressing to.
+test "buildStatusJson escapes Pango-special characters in tooltip lines" {
+    // Confirmed live: waybar's custom-module tooltip parses its text as
+    // Pango markup. Unescaped, a "Name <address>" From header is invalid
+    // markup that GTK fails to parse, rendering an empty tooltip rather
+    // than falling back to plain text -- that's the regression this
+    // guards against (an earlier version of this test asserted the
+    // opposite, unescaped behavior, based on a wrong conclusion from old
+    // GitHub issues rather than direct verification; see escapePango's
+    // comment for the full story).
     const got = try renderToString(testing.allocator, "1", .unread, &.{"Marketing <promo@example.com> & Friends"});
     defer testing.allocator.free(got);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, got, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings(
-        "Marketing <promo@example.com> & Friends",
+        "Marketing &lt;promo@example.com&gt; &amp; Friends",
         parsed.value.object.get("tooltip").?.string,
     );
 }
