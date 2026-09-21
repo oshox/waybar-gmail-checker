@@ -32,6 +32,7 @@ pub const State = struct {
 
 const state_file = "click.state";
 const lock_file = "click.lock";
+const popup_log_file = "popup.log";
 const max_state_file_size = 128;
 
 fn loadState(gpa: Allocator, io: Io, dir: Dir) State {
@@ -83,12 +84,29 @@ pub fn decideAction(state: State, now_ms: i64, popup_alive: bool, double_click_m
     return .spawn_popup;
 }
 
-fn spawnPopup(io: Io) !i32 {
+/// The popup used to run with stderr sent to .ignore, matching the
+/// short-lived fire-and-forget subcommands elsewhere in this project.
+/// That meant any panic, error print, or crash from a real click-spawned
+/// popup was silently thrown away -- there was no way to tell what had
+/// actually gone wrong when the popup misbehaved outside of a terminal.
+/// Captured here instead (truncated fresh on every launch, so this stays
+/// one small file rather than growing without bound) so a future report
+/// of "it didn't open" has an actual trace to look at.
+fn spawnPopup(io: Io, log_dir: Dir) !i32 {
+    const stderr_target: std.process.SpawnOptions.StdIo = blk: {
+        const log_file = log_dir.createFile(io, popup_log_file, .{
+            .truncate = true,
+            .permissions = cache.private_file_permissions,
+        }) catch break :blk .ignore;
+        break :blk .{ .file = log_file };
+    };
+    defer if (stderr_target == .file) stderr_target.file.close(io);
+
     const child = try std.process.spawn(io, .{
         .argv = &.{"waybar-gmail-popup"},
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .ignore,
+        .stderr = stderr_target,
     });
     return child.id.?;
 }
@@ -132,7 +150,7 @@ pub fn run(init: std.process.Init) u8 {
             if (popup_alive) terminateProcess(state.popup_pid.?);
         },
         .spawn_popup => {
-            next_popup_pid = spawnPopup(io) catch |err| blk: {
+            next_popup_pid = spawnPopup(io, dirs.state_dir) catch |err| blk: {
                 std.debug.print("waybar-gmail click: couldn't spawn popup: {t}\n", .{err});
                 break :blk null;
             };
