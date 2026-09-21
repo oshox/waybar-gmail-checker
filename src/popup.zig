@@ -386,12 +386,14 @@ fn buildRow(app: *AppState, msg: *const CachedMessage) !*c.GtkWidget {
 
     c.gtk_box_pack_start(root, event_box_widget, 1, 1, 0);
 
-    // Action buttons, right-aligned.
+    // Action buttons, right-aligned. Delete last/rightmost, not first:
+    // the most destructive action deserves to be the one you have to
+    // reach furthest for, not the one closest to an accidental click.
     const button_row_widget = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     const button_row: *c.GtkBox = @ptrCast(button_row_widget);
-    try addActionButton(app, button_row, msg.id, .trash);
     try addActionButton(app, button_row, msg.id, .archive);
     try addActionButton(app, button_row, msg.id, .mark_read);
+    try addActionButton(app, button_row, msg.id, .trash);
     c.gtk_box_pack_start(root, button_row_widget, 0, 0, 0);
 
     return root_widget;

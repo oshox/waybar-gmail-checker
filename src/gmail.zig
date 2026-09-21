@@ -202,6 +202,14 @@ pub fn trash(gpa: Allocator, client: *http.Client, access_token: []const u8, id:
         .method = .POST,
         .url = url,
         .access_token = access_token,
+        // The trash endpoint takes no meaningful body, unlike modify's
+        // label-change payload, but Google's frontend rejects a bodiless
+        // POST outright: 411 Length Required, "POST requests require a
+        // Content-length header" -- confirmed live against the real API.
+        // sendLive doesn't set Content-Length for a null payload, so an
+        // explicit empty JSON body (which does get one) is required here
+        // even though the server ignores its content.
+        .json_body = "{}",
         .fixture_key = fixtureKey(&fixture_buf, "trash", id),
     });
     defer resp.deinit(gpa);
