@@ -346,23 +346,16 @@ fn updateHeader(app: *AppState, text: []const u8) void {
     c.gtk_label_set_markup(@ptrCast(app.header_label), markup);
 }
 
-fn defaultHeaderText(gpa: Allocator, count: usize) [:0]const u8 {
-    _ = gpa;
-    return switch (count) {
-        0 => "Gmail — Inbox zero",
-        1 => "Gmail — 1 unread",
-        else => "Gmail — unread messages",
-    };
-}
-
 fn updateHeaderCount(app: *AppState) void {
-    if (app.messages.items.len == 1) {
-        updateHeader(app, "Gmail — 1 unread");
-        return;
+    switch (app.messages.items.len) {
+        0 => updateHeader(app, "Gmail — Inbox zero"),
+        1 => updateHeader(app, "Gmail — 1 unread"),
+        else => {
+            const text = std.fmt.allocPrint(app.gpa, "Gmail — {d} unread", .{app.messages.items.len}) catch return;
+            defer app.gpa.free(text);
+            updateHeader(app, text);
+        },
     }
-    const text = std.fmt.allocPrint(app.gpa, "Gmail — {d} unread", .{app.messages.items.len}) catch return;
-    defer app.gpa.free(text);
-    updateHeader(app, text);
 }
 
 /// Destroys every row widget currently in the list box (each one's
@@ -432,15 +425,28 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     persistCaches(app);
     notifyWaybar(app.io);
 
-    if (app.messages.items.len == 0) {
-        closePopup(app);
-    } else {
-        updateHeaderCount(app);
-    }
+    // Deliberately does not close the popup when the list empties: it
+    // used to, and that closed the window out from under the user after
+    // a single action -- reported live as "should stay open to allow
+    // several actions to be done at once". The window now stays open
+    // showing "Inbox zero" until the user dismisses it themselves
+    // (Escape, or clicking the module again).
+    updateHeaderCount(app);
 }
 
 fn refreshTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
     const app: *AppState = @ptrCast(@alignCast(user_data.?));
+
+    var http_client: std.http.Client = .{ .allocator = app.gpa, .io = app.io };
+    const new_token = oauth.getValidAccessToken(app.gpa, app.io, &http_client, app.creds, app.state_dir) catch |err| {
+        http_client.deinit();
+        std.debug.print("waybar-gmail-popup: token refresh failed: {t}\n", .{err});
+        return 0; // G_SOURCE_REMOVE -- keep whatever cached content was already shown
+    };
+    http_client.deinit();
+    oauth.secureFree(app.gpa, app.access_token);
+    app.access_token = new_token;
+
     const fetched = fetchMessages(app) catch |err| {
         std.debug.print("waybar-gmail-popup: refresh failed: {t}\n", .{err});
         return 0; // G_SOURCE_REMOVE -- keep whatever was already shown (cache or empty)
@@ -511,10 +517,17 @@ fn setupAppState(init_data: std.process.Init, gtk_app: *c.GtkApplication) !*AppS
     var creds = try oauth.loadClientCredentials(gpa, io, dirs.config_dir, "client_secret.json");
     errdefer creds.deinit(gpa);
 
-    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer http_client.deinit();
-    const access_token = try oauth.getValidAccessToken(gpa, io, &http_client, creds, dirs.state_dir);
-    errdefer oauth.secureFree(gpa, access_token);
+    // Deliberately not fetched here: reading/refreshing the access token
+    // can be a full network round trip to Google's token endpoint (any
+    // time the cached one is within `expiry_safety_margin_s` of expiring),
+    // and this function runs before any widget exists. Doing that here
+    // blocked window creation on network I/O -- confirmed live, the
+    // window did not appear for several seconds while this refreshed.
+    // The real token is fetched in `refreshTimeoutCb`, which runs via
+    // `g_timeout_add` *after* `gtk_widget_show_all`, so the window is on
+    // screen (with cached content, if any) before any network call.
+    const access_token = try gpa.alloc(u8, 0);
+    errdefer gpa.free(access_token);
 
     const app = try gpa.create(AppState);
 
