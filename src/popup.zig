@@ -26,31 +26,23 @@ const Io = std.Io;
 const Dir = Io.Dir;
 const Allocator = std.mem.Allocator;
 const c = @import("c.zig");
-const cache = @import("cache.zig");
 const config = @import("config.zig");
 const gmail = @import("gmail.zig");
 const http = @import("http.zig");
+const messages_cache = @import("messages_cache.zig");
 const oauth = @import("oauth.zig");
 const status = @import("status.zig");
 
-const messages_cache_file = "messages.json";
-const max_messages_cache_size = 256 * 1024;
-
+/// Wraps the shared cache entry with the one thing that's specific to
+/// this GTK-linked binary: the row widget currently showing it (if any
+/// -- absent right after loading the cache, before the list box is
+/// built).
 const CachedMessage = struct {
-    id: []u8,
-    thread_id: []u8,
-    from: []u8,
-    subject: []u8,
-    snippet: []u8,
+    data: messages_cache.Entry,
     row: ?*c.GtkWidget = null,
 
     fn deinit(self: *CachedMessage, gpa: Allocator) void {
-        gpa.free(self.id);
-        gpa.free(self.thread_id);
-        gpa.free(self.from);
-        gpa.free(self.subject);
-        gpa.free(self.snippet);
-        self.* = undefined;
+        self.data.deinit(gpa);
     }
 };
 
@@ -87,65 +79,39 @@ const AppState = struct {
 };
 
 // ---- structured message cache (read: instant open; write: after every refresh/action) ----
-
-const CachedMessageJson = struct {
-    id: []const u8,
-    thread_id: []const u8,
-    from: []const u8,
-    subject: []const u8,
-    snippet: []const u8,
-};
-
-fn saveMessagesCache(app: *AppState) !void {
-    var list: std.ArrayList(CachedMessageJson) = .empty;
-    defer list.deinit(app.gpa);
-    for (app.messages.items) |m| {
-        try list.append(app.gpa, .{ .id = m.id, .thread_id = m.thread_id, .from = m.from, .subject = m.subject, .snippet = m.snippet });
-    }
-
-    var out: Io.Writer.Allocating = .init(app.gpa);
-    defer out.deinit();
-    try std.json.Stringify.value(list.items, .{}, &out.writer);
-    try cache.atomicWrite(app.state_dir, app.io, messages_cache_file, out.written(), cache.private_file_permissions);
-}
+//
+// Both the cache file format and the fetch-from-Gmail logic live in
+// messages_cache.zig, shared with status.zig's opportunistic refresh
+// (see its own doc comment) -- this file only adds the GTK-specific
+// `row` field on top via CachedMessage.
 
 fn loadMessagesCache(gpa: Allocator, io: Io, dir: Dir) ?std.ArrayList(CachedMessage) {
-    const raw = gpa.alloc(u8, max_messages_cache_size) catch return null;
-    defer gpa.free(raw);
-    const data = dir.readFile(io, messages_cache_file, raw) catch return null;
-
-    const parsed = std.json.parseFromSlice([]CachedMessageJson, gpa, data, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
+    var entries = messages_cache.load(gpa, io, dir) orelse return null;
+    defer entries.deinit(gpa);
 
     var out: std.ArrayList(CachedMessage) = .empty;
-    for (parsed.value) |m| {
-        const entry = CachedMessage{
-            .id = gpa.dupe(u8, m.id) catch break,
-            .thread_id = gpa.dupe(u8, m.thread_id) catch break,
-            .from = gpa.dupe(u8, m.from) catch break,
-            .subject = gpa.dupe(u8, m.subject) catch break,
-            .snippet = gpa.dupe(u8, m.snippet) catch break,
-        };
-        out.append(gpa, entry) catch break;
-    }
+    for (entries.items) |e| out.append(gpa, .{ .data = e }) catch break;
     return out;
 }
 
 fn persistCaches(app: *AppState) void {
-    saveMessagesCache(app) catch |err| {
+    var entries: std.ArrayList(messages_cache.Entry) = .empty;
+    defer entries.deinit(app.gpa);
+    for (app.messages.items) |m| entries.append(app.gpa, m.data) catch {};
+
+    messages_cache.save(app.gpa, app.io, app.state_dir, entries.items) catch |err| {
         std.debug.print("waybar-gmail-popup: couldn't save message cache: {t}\n", .{err});
     };
 
-    var lines: std.ArrayList([]const u8) = .empty;
+    const lines = messages_cache.buildTooltipLines(app.gpa, entries.items) catch |err| {
+        std.debug.print("waybar-gmail-popup: couldn't build tooltip lines: {t}\n", .{err});
+        return;
+    };
     defer {
-        for (lines.items) |l| app.gpa.free(l);
-        lines.deinit(app.gpa);
+        for (lines) |l| app.gpa.free(l);
+        app.gpa.free(lines);
     }
-    for (app.messages.items) |m| {
-        const line = std.fmt.allocPrint(app.gpa, "{s} — {s}", .{ m.from, m.subject }) catch continue;
-        lines.append(app.gpa, line) catch app.gpa.free(line);
-    }
-    status.saveTooltipCache(app.gpa, app.io, app.state_dir, lines.items) catch |err| {
+    status.saveTooltipCache(app.gpa, app.io, app.state_dir, lines) catch |err| {
         std.debug.print("waybar-gmail-popup: couldn't save tooltip cache: {t}\n", .{err});
     };
 }
@@ -189,26 +155,24 @@ fn fetchMessages(app: *AppState) ![]CachedMessage {
     var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
     defer client.deinit();
 
-    const refs = try gmail.listUnread(app.gpa, &client, app.access_token, 15);
-    defer gmail.freeMessageRefs(app.gpa, refs);
+    const entries = try messages_cache.fetchFromApi(app.gpa, &client, app.access_token, 15);
+    // Each entry's string data is moved (by value -- just the slice
+    // pointers) into `out` below, so only the now-empty outer array
+    // needs freeing here, not messages_cache.freeEntries.
+    defer app.gpa.free(entries);
 
     var out: std.ArrayList(CachedMessage) = .empty;
     errdefer {
         for (out.items) |*m| m.deinit(app.gpa);
         out.deinit(app.gpa);
     }
-
-    for (refs) |ref| {
-        var preview = gmail.getPreview(app.gpa, &client, app.access_token, ref.id) catch continue;
-        defer preview.deinit(app.gpa);
-        try out.append(app.gpa, .{
-            .id = try app.gpa.dupe(u8, ref.id),
-            .thread_id = try app.gpa.dupe(u8, ref.thread_id),
-            .from = try app.gpa.dupe(u8, preview.from),
-            .subject = try app.gpa.dupe(u8, preview.subject),
-            .snippet = try app.gpa.dupe(u8, preview.snippet),
-        });
-    }
+    // ensureTotalCapacityPrecise + appendAssumeCapacity rather than a
+    // plain append in the loop: the fallible allocation happens once,
+    // up front, so there's no partial-transfer state to reason about if
+    // it fails partway through -- either every entry moves into `out`,
+    // or none do.
+    try out.ensureTotalCapacityPrecise(app.gpa, entries.len);
+    for (entries) |e| out.appendAssumeCapacity(.{ .data = e });
     return out.toOwnedSlice(app.gpa);
 }
 
@@ -349,7 +313,7 @@ fn buildRow(app: *AppState, msg: *const CachedMessage) !*c.GtkWidget {
 
     const from_widget = c.gtk_label_new(null);
     const from_label: *c.GtkLabel = @ptrCast(from_widget);
-    setLabelBold(app.gpa, from_label, msg.from);
+    setLabelBold(app.gpa, from_label, msg.data.from);
     c.gtk_label_set_xalign(from_label, 0);
     c.gtk_label_set_ellipsize(from_label, c.PANGO_ELLIPSIZE_END);
     c.gtk_box_pack_start(content, from_widget, 0, 0, 0);
@@ -357,8 +321,8 @@ fn buildRow(app: *AppState, msg: *const CachedMessage) !*c.GtkWidget {
     const subject_widget = c.gtk_label_new(null);
     const subject_label: *c.GtkLabel = @ptrCast(subject_widget);
     {
-        const escaped = status.escapePango(app.gpa, msg.subject) catch msg.subject;
-        defer if (escaped.ptr != msg.subject.ptr) app.gpa.free(escaped);
+        const escaped = status.escapePango(app.gpa, msg.data.subject) catch msg.data.subject;
+        defer if (escaped.ptr != msg.data.subject.ptr) app.gpa.free(escaped);
         const z = std.fmt.allocPrintSentinel(app.gpa, "{s}", .{escaped}, 0) catch null;
         if (z) |zz| {
             defer app.gpa.free(zz);
@@ -371,7 +335,7 @@ fn buildRow(app: *AppState, msg: *const CachedMessage) !*c.GtkWidget {
 
     const snippet_widget = c.gtk_label_new(null);
     const snippet_label: *c.GtkLabel = @ptrCast(snippet_widget);
-    setLabelDim(app.gpa, snippet_label, msg.snippet);
+    setLabelDim(app.gpa, snippet_label, msg.data.snippet);
     c.gtk_label_set_xalign(snippet_label, 0);
     c.gtk_label_set_ellipsize(snippet_label, c.PANGO_ELLIPSIZE_END);
     c.gtk_box_pack_start(content, snippet_widget, 0, 0, 0);
@@ -381,7 +345,7 @@ fn buildRow(app: *AppState, msg: *const CachedMessage) !*c.GtkWidget {
 
     const open_ctx = try app.gpa.create(OpenContext);
     errdefer app.gpa.destroy(open_ctx);
-    open_ctx.* = .{ .app = app, .thread_id = try app.gpa.dupe(u8, msg.thread_id) };
+    open_ctx.* = .{ .app = app, .thread_id = try app.gpa.dupe(u8, msg.data.thread_id) };
     _ = c.g_signal_connect_data(event_box_widget, "button-press-event", @ptrCast(&onRowClicked), open_ctx, OpenContext.destroy, 0);
 
     c.gtk_box_pack_start(root, event_box_widget, 1, 1, 0);
@@ -391,9 +355,9 @@ fn buildRow(app: *AppState, msg: *const CachedMessage) !*c.GtkWidget {
     // reach furthest for, not the one closest to an accidental click.
     const button_row_widget = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     const button_row: *c.GtkBox = @ptrCast(button_row_widget);
-    try addActionButton(app, button_row, msg.id, .archive);
-    try addActionButton(app, button_row, msg.id, .mark_read);
-    try addActionButton(app, button_row, msg.id, .trash);
+    try addActionButton(app, button_row, msg.data.id, .archive);
+    try addActionButton(app, button_row, msg.data.id, .mark_read);
+    try addActionButton(app, button_row, msg.data.id, .trash);
     c.gtk_box_pack_start(root, button_row_widget, 0, 0, 0);
 
     return root_widget;
@@ -492,7 +456,7 @@ fn resizeToFitContentCb(user_data: c.gpointer) callconv(.c) c.gboolean {
 
 fn findMessageIndex(app: *AppState, message_id: []const u8) ?usize {
     for (app.messages.items, 0..) |m, i| {
-        if (std.mem.eql(u8, m.id, message_id)) return i;
+        if (std.mem.eql(u8, m.data.id, message_id)) return i;
     }
     return null;
 }
