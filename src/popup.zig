@@ -169,51 +169,47 @@ fn notifyWaybar(io: Io) void {
 
 // ---- fetching ----
 
-/// Fetches the unread list, then adds one row at a time as each
-/// message's preview arrives, pumping the main loop after each -- rather
-/// than building the whole list off-screen and swapping it in once
-/// everything is ready. Both take the same total time (this project has
-/// no threads; every preview is still a separate sequential blocking
-/// call), but the previous all-at-once version left the window visibly
-/// frozen for that whole stretch, which live testing reported as the
-/// popup being slow to appear/respond. Rows appearing progressively, and
-/// the loop staying responsive (Escape, scrolling) between them, reads
-/// as "working" instead of "stuck" for the exact same wall-clock cost.
-fn refreshMessagesIncremental(app: *AppState) !void {
+/// Builds the whole updated message list off-screen, then swaps it in
+/// with a single show_all in populateListFromMessages.
+///
+/// A per-row "add it, show it, pump the main loop" version of this was
+/// tried instead, to make rows appear progressively rather than after
+/// one long pause. Reverted: live testing showed only one row out of
+/// eight ever got a real size allocation -- every other row (and its
+/// buttons) came back 1x1px, still flagged "visible" but with no actual
+/// area, which is why the action buttons disappeared. Manually pumping
+/// gtk_main_iteration mid-layout, while gtk_scrolled_window's natural-
+/// height propagation is also renegotiating on every single addition,
+/// does not reliably reach a settled layout -- confirmed by walking the
+/// widget tree with gtk_widget_get_allocated_height/width after each
+/// pump. It's also the likely cause of the popup feeling slower rather
+/// than faster: each addition was forcing a fresh, incomplete resize
+/// negotiation instead of one clean layout pass at the end.
+fn fetchMessages(app: *AppState) ![]CachedMessage {
     var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
     defer client.deinit();
 
     const refs = try gmail.listUnread(app.gpa, &client, app.access_token, 15);
     defer gmail.freeMessageRefs(app.gpa, refs);
 
-    // Only replace what's on screen once we know the real list -- on
-    // error above, whatever cache/previous content was showing is left
-    // untouched. The count is shown immediately, ahead of any preview.
-    for (app.messages.items) |*m| m.deinit(app.gpa);
-    app.messages.clearRetainingCapacity();
-    clearListBox(app);
-    updateHeaderForCount(app, refs.len);
+    var out: std.ArrayList(CachedMessage) = .empty;
+    errdefer {
+        for (out.items) |*m| m.deinit(app.gpa);
+        out.deinit(app.gpa);
+    }
 
     for (refs) |ref| {
         var preview = gmail.getPreview(app.gpa, &client, app.access_token, ref.id) catch continue;
         defer preview.deinit(app.gpa);
-        try app.messages.append(app.gpa, .{
+        try out.append(app.gpa, .{
             .id = try app.gpa.dupe(u8, ref.id),
             .thread_id = try app.gpa.dupe(u8, ref.thread_id),
             .from = try app.gpa.dupe(u8, preview.from),
             .subject = try app.gpa.dupe(u8, preview.subject),
             .snippet = try app.gpa.dupe(u8, preview.snippet),
         });
-
-        const msg_ptr = &app.messages.items[app.messages.items.len - 1];
-        const row = buildRow(app, msg_ptr) catch continue;
-        msg_ptr.row = row;
-        c.gtk_container_add(@ptrCast(app.list_box), row);
-        c.gtk_widget_show_all(row);
-        while (c.gtk_events_pending() != 0) _ = c.gtk_main_iteration();
     }
-
-    persistCaches(app);
+    return out.toOwnedSlice(app.gpa);
 }
 
 // ---- UI construction ----
@@ -256,9 +252,52 @@ const ActionContext = struct {
     }
 };
 
+/// Owns the copies performActionDeferredCb needs once it actually runs.
+/// Not the same as ActionContext: that one (and its message_id) belongs
+/// to the button and is freed the moment the row is destroyed below, so
+/// anything needed after that point has to be its own copy.
+const PendingActionContext = struct {
+    app: *AppState,
+    message_id: []u8,
+    kind: ActionKind,
+};
+
+fn performActionDeferredCb(user_data: c.gpointer) callconv(.c) c.gboolean {
+    const ctx: *PendingActionContext = @ptrCast(@alignCast(user_data.?));
+    performAction(ctx.app, ctx.message_id, ctx.kind);
+    ctx.app.gpa.free(ctx.message_id);
+    ctx.app.gpa.destroy(ctx);
+    return 0; // G_SOURCE_REMOVE: one-shot
+}
+
 fn onActionClicked(_: *c.GtkWidget, user_data: c.gpointer) callconv(.c) void {
     const ctx: *ActionContext = @ptrCast(@alignCast(user_data.?));
-    performAction(ctx.app, ctx.message_id, ctx.kind);
+    const app = ctx.app;
+    const kind = ctx.kind;
+    const message_id_copy = app.gpa.dupe(u8, ctx.message_id) catch return;
+
+    // Optimistic: remove from the UI immediately, before the (still
+    // synchronous, still blocking) network call. Destroying the row
+    // here isn't enough on its own for it to actually disappear from
+    // the screen -- GTK doesn't repaint until control returns to the
+    // main loop. Manually pumping the loop with gtk_main_iteration()
+    // right here was tried and reverted: it corrupted layout elsewhere
+    // in this file (see fetchMessages's doc comment) when used to force
+    // newly-added widgets to render, so it isn't trusted for this
+    // either. Deferring the actual network call to the next main-loop
+    // iteration via g_timeout_add -- the same mechanism refreshTimeoutCb
+    // already uses successfully -- lets GTK process the destroy's
+    // repaint on its own, through a path already proven to work.
+    if (findMessageIndex(app, ctx.message_id)) |idx| {
+        if (app.messages.items[idx].row) |row| c.gtk_widget_destroy(row);
+    }
+
+    const deferred = app.gpa.create(PendingActionContext) catch {
+        app.gpa.free(message_id_copy);
+        return;
+    };
+    deferred.* = .{ .app = app, .message_id = message_id_copy, .kind = kind };
+    _ = c.g_timeout_add(1, performActionDeferredCb, deferred);
 }
 
 const OpenContext = struct {
@@ -420,17 +459,10 @@ fn findMessageIndex(app: *AppState, message_id: []const u8) ?usize {
     return null;
 }
 
+/// The row for `message_id` has already been destroyed optimistically by
+/// onActionClicked by the time this runs (see PendingActionContext).
 fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void {
     const idx = findMessageIndex(app, message_id) orelse return;
-
-    // Optimistic: remove from the UI immediately. Destroying it isn't
-    // enough on its own -- GTK doesn't actually repaint until control
-    // returns to the main loop, and the network call below blocks this
-    // same (only) thread for the duration of the request. Without
-    // pumping the loop here, the row stayed visible for the entire
-    // round trip, which live testing surfaced as "doesn't get removed".
-    if (app.messages.items[idx].row) |row| c.gtk_widget_destroy(row);
-    while (c.gtk_events_pending() != 0) _ = c.gtk_main_iteration();
 
     var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
     defer client.deinit();
@@ -477,9 +509,17 @@ fn refreshTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
     oauth.secureFree(app.gpa, app.access_token);
     app.access_token = new_token;
 
-    refreshMessagesIncremental(app) catch |err| {
+    const fetched = fetchMessages(app) catch |err| {
         std.debug.print("waybar-gmail-popup: refresh failed: {t}\n", .{err});
+        return 0; // G_SOURCE_REMOVE -- keep whatever was already shown (cache or empty)
     };
+
+    for (app.messages.items) |*m| m.deinit(app.gpa);
+    app.messages.deinit(app.gpa);
+    app.messages = .fromOwnedSlice(fetched);
+
+    populateListFromMessages(app);
+    persistCaches(app);
     return 0; // G_SOURCE_REMOVE: one-shot
 }
 

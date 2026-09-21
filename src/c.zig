@@ -132,12 +132,6 @@ pub extern fn gtk_list_box_new() *GtkWidget;
 pub extern fn gtk_button_new_with_label(label: [*:0]const u8) *GtkWidget;
 pub extern fn gtk_event_box_new() *GtkWidget;
 
-// ---- Main loop (used to flush pending UI updates before a blocking
-// call, e.g. an optimistic row removal that must be visible on screen
-// before a synchronous network request starts) ----
-pub extern fn gtk_events_pending() gboolean;
-pub extern fn gtk_main_iteration() gboolean;
-
 // ---- gtk-layer-shell ----
 pub extern fn gtk_layer_init_for_window(window: *GtkWindow) void;
 pub extern fn gtk_layer_set_layer(window: *GtkWindow, layer: GtkLayerShellLayer) void;
