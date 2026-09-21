@@ -67,6 +67,15 @@ const AppState = struct {
     list_box: *c.GtkWidget,
     header_label: *c.GtkWidget,
     messages: std.ArrayList(CachedMessage) = .empty,
+    /// A newly created layer-shell surface with ON_DEMAND keyboard mode
+    /// starts without focus, and GTK fires a synthetic "focus-out-event"
+    /// for that initial unfocused state as part of window realization --
+    /// confirmed live (this is what "single click does nothing" turned
+    /// out to be): onActivate -> show_all -> an immediate focus-out,
+    /// closing the window before the user ever sees it. Only a focus-out
+    /// that follows a genuine focus-*in* means "the user focused this and
+    /// then clicked away," which is the only case that should close it.
+    ever_focused: bool = false,
     /// Guards against closePopup running twice: GTK signals that can
     /// legitimately fire close to simultaneously (a focus-out arriving
     /// right as Escape is pressed, for instance) must not both try to
@@ -494,9 +503,15 @@ fn onKeyPress(_: *c.GtkWidget, event: *c.GdkEvent, user_data: c.gpointer) callco
     return 0;
 }
 
+fn onFocusIn(_: *c.GtkWidget, _: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    app.ever_focused = true;
+    return 0;
+}
+
 fn onFocusOut(_: *c.GtkWidget, _: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
     const app: *AppState = @ptrCast(@alignCast(user_data.?));
-    closePopup(app);
+    if (app.ever_focused) closePopup(app);
     return 0;
 }
 
@@ -594,6 +609,7 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
     c.gtk_container_add(@ptrCast(window), outer_widget);
 
     _ = c.g_signal_connect_data(window, "key-press-event", @ptrCast(&onKeyPress), app, null, 0);
+    _ = c.g_signal_connect_data(window, "focus-in-event", @ptrCast(&onFocusIn), app, null, 0);
     _ = c.g_signal_connect_data(window, "focus-out-event", @ptrCast(&onFocusOut), app, null, 0);
     // AppState is freed by closePopup itself (clearListBox, then destroy
     // the window, then app.deinit()), not via a "destroy" signal handler

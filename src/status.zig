@@ -78,10 +78,13 @@ fn loadTooltipLines(gpa: Allocator, io: Io, dir: Dir) ?[][]u8 {
 
 // ---- JSON status line ----
 
-/// Escapes text for use inside a Pango-markup tooltip: waybar renders
-/// `tooltip-format`/custom-module tooltips as Pango markup, and a literal
-/// `<`/`&` in a sender's display name or a "Marketing <noreply@...>"-style
-/// From header is otherwise misinterpreted as markup.
+/// Escapes text for use as Pango markup -- needed for the popup's GTK
+/// labels (popup.zig calls this before gtk_label_set_markup), which
+/// genuinely do render Pango markup. NOT used for the waybar tooltip
+/// below: confirmed live (a real bug, not a hedge) that waybar's
+/// custom-module tooltips render as plain text, not markup -- escaping
+/// them here just means the user sees literal "&lt;"/"&gt;" text in
+/// every "Name <address>"-shaped From header instead of "<"/">".
 pub fn escapePango(gpa: Allocator, text: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -100,7 +103,9 @@ pub fn escapePango(gpa: Allocator, text: []const u8) Allocator.Error![]u8 {
 /// "tooltip","class"}`. `text` is the module's visible label (typically
 /// the unread count, or "" to self-hide per `hide-empty-text`); `class`
 /// drives waybar CSS (`#custom-gmail.unread` etc.); `tooltip_lines` are
-/// joined with newlines and Pango-escaped.
+/// joined with newlines as plain text -- waybar's custom-module tooltips
+/// don't render Pango markup, so no escaping here (see escapePango's own
+/// comment for the popup, where it's a different, real rendering context).
 pub fn buildStatusJson(
     gpa: Allocator,
     writer: *Io.Writer,
@@ -112,9 +117,7 @@ pub fn buildStatusJson(
     defer tooltip.deinit(gpa);
     for (tooltip_lines, 0..) |line, i| {
         if (i != 0) try tooltip.append(gpa, '\n');
-        const escaped = try escapePango(gpa, line);
-        defer gpa.free(escaped);
-        try tooltip.appendSlice(gpa, escaped);
+        try tooltip.appendSlice(gpa, line);
     }
 
     const class_str = @tagName(class);
@@ -274,14 +277,20 @@ test "buildStatusJson joins multiple tooltip lines with newlines" {
     try testing.expectEqualStrings("GitHub — PR merged\nStripe — Invoice ready", parsed.value.object.get("tooltip").?.string);
 }
 
-test "buildStatusJson escapes Pango-special characters in tooltip lines" {
+test "buildStatusJson leaves tooltip lines as plain text, unescaped" {
+    // Confirmed live: waybar's custom-module tooltips render as plain
+    // text, not Pango markup (unlike the popup's GTK labels, which
+    // genuinely do use markup -- see escapePango). Escaping here would
+    // make every "Name <address>"-shaped From header show up with
+    // literal "&lt;"/"&gt;" text in the tooltip, which is exactly the
+    // bug this guards against regressing to.
     const got = try renderToString(testing.allocator, "1", .unread, &.{"Marketing <promo@example.com> & Friends"});
     defer testing.allocator.free(got);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, got, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings(
-        "Marketing &lt;promo@example.com&gt; &amp; Friends",
+        "Marketing <promo@example.com> & Friends",
         parsed.value.object.get("tooltip").?.string,
     );
 }
