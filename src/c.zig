@@ -100,6 +100,8 @@ pub extern fn gtk_application_window_new(application: *GtkApplication) *GtkWidge
 // ---- GtkWindow / GtkWidget / GtkContainer ----
 pub extern fn gtk_window_set_title(window: *GtkWindow, title: [*:0]const u8) void;
 pub extern fn gtk_window_set_default_size(window: *GtkWindow, width: gint, height: gint) void;
+pub extern fn gtk_window_resize(window: *GtkWindow, width: gint, height: gint) void;
+pub extern fn gtk_widget_get_preferred_height(widget: *GtkWidget, minimum_height: ?*gint, natural_height: ?*gint) void;
 pub extern fn gtk_widget_show_all(widget: *GtkWidget) void;
 pub extern fn gtk_widget_destroy(widget: *GtkWidget) void;
 pub extern fn gtk_widget_set_size_request(widget: *GtkWidget, width: gint, height: gint) void;

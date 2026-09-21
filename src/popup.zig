@@ -450,6 +450,42 @@ fn populateListFromMessages(app: *AppState) void {
     }
     c.gtk_widget_show_all(app.list_box);
     updateHeaderCount(app);
+
+    // gtk-layer-shell negotiates the surface size with the compositor
+    // once, at the initial configure/ack_configure handshake -- it does
+    // not automatically renegotiate just because a widget's natural size
+    // grew afterward. Confirmed live: the actual allocated/committed
+    // surface size kept snapping back to the (tiny, ~1-message) minimum
+    // shortly after adding more rows, no matter how long we waited. An
+    // explicit gtk_window_resize call is required to make the compositor
+    // actually grant the new size -- but calling it synchronously, right
+    // here, hits gtk_widget_get_preferred_height before GTK has processed
+    // the resize this function just queued (confirmed live: it returns 0,
+    // tripping gtk_window_resize's own "height > 0" assertion). Deferred
+    // one main-loop iteration via g_timeout_add(1, ...), by which point
+    // the queued resize has been processed and the preferred height is
+    // real.
+    _ = c.g_timeout_add(1, resizeToFitContentCb, app);
+}
+
+fn resizeToFitContentCb(user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    var natural_height: c.gint = 0;
+    c.gtk_widget_get_preferred_height(@ptrCast(app.window), null, &natural_height);
+    if (natural_height > 0) {
+        // gtk-layer-shell's own header comment documents this exact
+        // two-call pattern: set_size_request first (the real target
+        // size), then gtk_window_resize with throwaway arguments purely
+        // to make gtk-layer-shell re-read that size request and push a
+        // fresh zwlr_layer_surface_v1.set_size to the compositor -- it
+        // does not do this on its own just because the window's natural
+        // size changed. Confirmed via WAYLAND_DEBUG=1: without the
+        // gtk_window_resize call, no new set_size is ever sent at all,
+        // no matter how the request is made or how long you wait.
+        c.gtk_widget_set_size_request(@ptrCast(app.window), 360, natural_height);
+        c.gtk_window_resize(app.window, 1, 1);
+    }
+    return 0; // G_SOURCE_REMOVE: one-shot
 }
 
 fn findMessageIndex(app: *AppState, message_id: []const u8) ?usize {
@@ -633,9 +669,8 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
     // the window opens at regardless of content, which forced 400px of
     // height (mostly blank) even with zero or one message. Fixing the
     // width but leaving height at -1 (natural) lets the window's actual
-    // size come from its children -- header + however tall the list
-    // ends up being, capped by gtk_scrolled_window_set_max_content_height
-    // below.
+    // size come from its children -- header + however tall the list of
+    // messages actually is.
     c.gtk_widget_set_size_request(window_widget, 360, -1);
 
     c.gtk_layer_init_for_window(window);
@@ -660,11 +695,15 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
     c.gtk_box_pack_start(outer, header_widget, 0, 0, 0);
 
     const scrolled_widget = c.gtk_scrolled_window_new(null, null);
-    // Size to content up to 340px, rather than always claiming 340px --
-    // the fixed size_request this replaced left a block of empty space
-    // below the list whenever there were fewer than ~3 messages.
+    // Size to content, full stop -- no max_content_height cap. A cap
+    // here (340px, previously) meant the window only ever fit ~3 rows
+    // before a scrollbar appeared, and the whole point of this popup is
+    // to see everything at a glance without scrolling. GtkScrolledWindow
+    // is still used rather than a plain box so an unusually long list
+    // (more unread than fits on screen) degrades to scrolling instead of
+    // silently clipping content with no way to reach it -- an edge case
+    // this should never hit in normal use, not the common case.
     c.gtk_scrolled_window_set_propagate_natural_height(scrolled_widget, 1);
-    c.gtk_scrolled_window_set_max_content_height(scrolled_widget, 340);
     const list_box_widget = c.gtk_list_box_new();
     app.list_box = list_box_widget;
     c.gtk_container_add(@ptrCast(scrolled_widget), list_box_widget);
