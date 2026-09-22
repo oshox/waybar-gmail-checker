@@ -64,6 +64,10 @@ pub const GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND: GtkLayerShellKeyboardMode = 2
 /// X11 keysym value, not something GTK versions change.
 pub const GDK_KEY_Escape: guint = 0xff1b;
 
+/// Read directly from /usr/include/gtk-3.0/gdk/gdktypes.h's GdkEventMask.
+pub const GDK_ENTER_NOTIFY_MASK: gint = 1 << 12;
+pub const GDK_LEAVE_NOTIFY_MASK: gint = 1 << 13;
+
 pub const GConnectFlags = c_uint;
 pub const GSourceFunc = *const fn (gpointer) callconv(.c) gboolean;
 pub const GCallback = *const anyopaque;
@@ -91,6 +95,7 @@ pub extern fn g_signal_connect_data(
 pub extern fn g_application_run(application: *GApplication, argc: c_int, argv: ?[*]?[*:0]u8) c_int;
 pub extern fn g_application_quit(application: *GApplication) void;
 pub extern fn g_timeout_add(interval: guint, function: GSourceFunc, data: gpointer) guint;
+pub extern fn g_source_remove(tag: guint) gboolean;
 pub extern fn g_list_free(list: ?*GList) void;
 
 // ---- GtkApplication ----
@@ -105,6 +110,7 @@ pub extern fn gtk_widget_get_preferred_height(widget: *GtkWidget, minimum_height
 pub extern fn gtk_widget_show_all(widget: *GtkWidget) void;
 pub extern fn gtk_widget_destroy(widget: *GtkWidget) void;
 pub extern fn gtk_widget_set_size_request(widget: *GtkWidget, width: gint, height: gint) void;
+pub extern fn gtk_widget_add_events(widget: *GtkWidget, events: gint) void;
 pub extern fn gtk_widget_set_margin_start(widget: *GtkWidget, margin: gint) void;
 pub extern fn gtk_widget_set_margin_end(widget: *GtkWidget, margin: gint) void;
 pub extern fn gtk_widget_set_margin_top(widget: *GtkWidget, margin: gint) void;

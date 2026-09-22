@@ -66,6 +66,13 @@ const AppState = struct {
     /// operate on an already-finalized widget, and AppState itself would
     /// be freed twice via the resulting double "destroy" signal.
     closing: bool = false,
+    /// The pending close-after-hover-leaves timeout source, if one is
+    /// currently scheduled -- null otherwise. Tracked so a re-entry can
+    /// cancel it (see onWindowEnter) and so closePopup can cancel it on
+    /// every OTHER close path (Escape, an action emptying the list):
+    /// leaving it scheduled would fire 500ms later against an AppState
+    /// that closePopup already freed.
+    hover_close_timer: ?c.guint = null,
 
     fn deinit(self: *AppState) void {
         for (self.messages.items) |*m| m.deinit(self.gpa);
@@ -494,8 +501,17 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     // a single action -- reported live as "should stay open to allow
     // several actions to be done at once". The window now stays open
     // showing "Inbox zero" until the user dismisses it themselves
-    // (Escape, or clicking the module again).
+    // (Escape, hover-leave, or clicking the module again).
     updateHeaderCount(app);
+
+    // The row is already gone (destroyed optimistically by
+    // onActionClicked, before this even ran) -- but unlike
+    // populateListFromMessages's full rebuild elsewhere, that direct
+    // removal never re-triggers the gtk-layer-shell resize dance (see
+    // resizeToFitContentCb's own comment for why one is needed at all).
+    // Without this, the window stayed at its pre-action size, one
+    // row's worth too tall, after every single action.
+    _ = c.g_timeout_add(1, resizeToFitContentCb, app);
 }
 
 fn refreshTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
@@ -550,6 +566,13 @@ fn refreshTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
 fn closePopup(app: *AppState) void {
     if (app.closing) return;
     app.closing = true;
+    // A pending hover-close timer left scheduled here would fire 500ms
+    // from now against an AppState this function is about to free --
+    // cancel it regardless of which path is actually closing the popup.
+    if (app.hover_close_timer) |id| {
+        _ = c.g_source_remove(id);
+        app.hover_close_timer = null;
+    }
     clearListBox(app);
     c.gtk_widget_destroy(@ptrCast(app.window));
     app.deinit();
@@ -562,6 +585,43 @@ fn onKeyPress(_: *c.GtkWidget, event: *c.GdkEvent, user_data: c.gpointer) callco
         closePopup(app);
     }
     return 0;
+}
+
+/// Not the same failure mode as the focus-in/focus-out attempts
+/// documented in onActivate's own comment: those were about *keyboard*
+/// focus, which a newly-created ON_DEMAND layer-shell surface can be
+/// granted and lose spuriously as part of its own setup, independent of
+/// anything the user does. Enter/leave-notify are *pointer* crossing
+/// events tied to actual mouse movement over the surface, not keyboard
+/// focus negotiation -- a different event class without that
+/// documented failure mode.
+fn onWindowEnter(_: *c.GtkWidget, _: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    if (app.hover_close_timer) |id| {
+        _ = c.g_source_remove(id);
+        app.hover_close_timer = null;
+    }
+    return 0;
+}
+
+fn onWindowLeave(_: *c.GtkWidget, _: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    // Moving between two child widgets (e.g. adjacent action buttons)
+    // can transiently cross the window's own boundary and back; only
+    // start a new timer if one isn't already pending, so rapid
+    // leave/enter pairs don't keep resetting a close that was already
+    // in flight for no reason (harmless either way, but avoidable).
+    if (app.hover_close_timer == null) {
+        app.hover_close_timer = c.g_timeout_add(500, hoverCloseTimeoutCb, app);
+    }
+    return 0;
+}
+
+fn hoverCloseTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    app.hover_close_timer = null; // this source is about to be removed regardless (G_SOURCE_REMOVE)
+    closePopup(app);
+    return 0; // G_SOURCE_REMOVE: one-shot
 }
 
 // ---- activation ----
@@ -679,18 +739,24 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
 
     _ = c.g_signal_connect_data(window, "key-press-event", @ptrCast(&onKeyPress), app, null, 0);
     // Deliberately no focus-out-event handler: tried (twice) to close the
-    // popup automatically when it loses focus, and both attempts were
-    // real bugs, not edge cases -- a newly created layer-shell surface
-    // gets what looks like a genuine focus-in immediately followed by a
-    // focus-out as part of the compositor's own window-setup sequence,
-    // not real user interaction, and this happens with unpredictable
-    // timing (confirmed by the same reproduction sometimes surviving
-    // 2+ seconds and sometimes not, testing live). There's no reliable
-    // way to distinguish that from an actual "user clicked away" from
-    // inside this process. Closing is instead handled entirely by
-    // explicit, unambiguous actions: Escape, an action emptying the
-    // list, or clicking the module again (click.zig already toggles an
-    // open popup closed).
+    // popup automatically when it loses *keyboard* focus, and both
+    // attempts were real bugs, not edge cases -- a newly created
+    // layer-shell surface gets what looks like a genuine focus-in
+    // immediately followed by a focus-out as part of the compositor's
+    // own window-setup sequence, not real user interaction, and this
+    // happens with unpredictable timing (confirmed by the same
+    // reproduction sometimes surviving 2+ seconds and sometimes not,
+    // testing live). There's no reliable way to distinguish that from an
+    // actual "user clicked away" from inside this process.
+    //
+    // enter/leave-notify below are a different event class -- pointer
+    // crossings tied to actual mouse movement, not keyboard focus
+    // negotiation -- and don't share that failure mode. Closing overall
+    // is handled by: Escape, this hover-leave timeout, or clicking the
+    // module again (click.zig already toggles an open popup closed).
+    c.gtk_widget_add_events(window_widget, c.GDK_ENTER_NOTIFY_MASK | c.GDK_LEAVE_NOTIFY_MASK);
+    _ = c.g_signal_connect_data(window, "enter-notify-event", @ptrCast(&onWindowEnter), app, null, 0);
+    _ = c.g_signal_connect_data(window, "leave-notify-event", @ptrCast(&onWindowLeave), app, null, 0);
     // AppState is freed by closePopup itself (clearListBox, then destroy
     // the window, then app.deinit()), not via a "destroy" signal handler
     // -- see closePopup's own comment for why that ordering matters.
