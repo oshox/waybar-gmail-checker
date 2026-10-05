@@ -1,15 +1,15 @@
-//! Builds the waybar custom-module JSON status line. The one call every
-//! poll pays for is the cheap GET to labels/INBOX via
-//! gmail.getUnreadCount; the fuller message-list-and-previews fetch
-//! (messages_cache.fetchFromApi) only happens opportunistically, when
-//! the unread count just changed from what's cached -- see `run` for
-//! why that's the right moment to pay for it.
+//! Builds the waybar custom-module JSON status line. Every poll starts
+//! with the cheap GET to labels/INBOX via gmail.getUnreadCount; while
+//! anything is unread it then also refreshes the message list and
+//! previews (messages_cache.fetchFromApi) -- every poll, not only when the
+//! count changed, so the popup always opens from a cache at most one poll
+//! interval old. See `run` for the details.
 //!
 //! The tooltip is built from that same structured message cache
-//! (messages_cache), which either this poll's own opportunistic refresh
-//! or the popup (whichever last ran) keeps up to date. If neither has
-//! ever run, the tooltip falls back to a generic line instead of
-//! `status` doing its own unconditional extra network round trips.
+//! (messages_cache), which this poll's refresh or the popup (whichever
+//! last ran) keeps up to date. If neither has ever run, or a refresh
+//! failed, the tooltip falls back to the last cached lines or a generic
+//! line rather than failing the poll.
 //!
 //! Split by testability, same pattern as gmail.zig/oauth.zig:
 //! `buildStatusJson` (pure, given already-decided text/class/tooltip
@@ -139,7 +139,7 @@ pub fn buildStatusJson(
 
 fn genericTooltip(buf: []u8, class: StatusClass, count: u32) []const u8 {
     return switch (class) {
-        .read => "Inbox zero",
+        .read => "No unread messages",
         .unread => std.fmt.bufPrint(buf, "{d} unread message{s}", .{ count, if (count == 1) "" else "s" }) catch "unread messages",
         .unauthenticated => "Not signed in -- run: waybar-gmail auth",
         .@"error" => "Couldn't reach Gmail",
@@ -209,11 +209,11 @@ pub fn run(init: std.process.Init) u8 {
     var text_buf: [16]u8 = undefined;
     const text = if (count == 0) "" else std.fmt.bufPrint(&text_buf, "{d}", .{count}) catch "";
 
-    // Tooltip lines for this run: freshly fetched below if an
-    // opportunistic refresh happens, otherwise whatever's cached from
-    // the popup's or a previous poll's refresh, otherwise a generic
-    // fallback. Owned by this if non-null; freed once at the end either
-    // way, regardless of which source it came from.
+    // Tooltip lines for this run: freshly fetched below if the refresh
+    // succeeds, otherwise whatever's cached from the popup's or a previous
+    // poll's refresh, otherwise a generic fallback. Owned by this if
+    // non-null; freed once at the end either way, regardless of which
+    // source it came from.
     var owned_lines: ?[][]u8 = null;
     defer if (owned_lines) |lines| freeTooltipLines(gpa, lines);
 
@@ -224,37 +224,38 @@ pub fn run(init: std.process.Init) u8 {
         // nonzero again, or painted by the popup's cache-first open.
         messages_cache.save(gpa, io, dirs.state_dir, &.{}) catch {};
         saveTooltipCache(gpa, io, dirs.state_dir, &.{}) catch {};
-    } else opportunistic_refresh: {
-        const cached_len: usize = blk: {
-            var cached = messages_cache.load(gpa, io, dirs.state_dir) orelse break :blk 0;
-            defer {
-                for (cached.items) |*e| e.deinit(gpa);
-                cached.deinit(gpa);
-            }
-            break :blk cached.items.len;
-        };
-        // Only pay for the fuller list+preview fetch when the count
-        // actually changed since the last refresh (a previous poll or
-        // the popup) -- most 60s polls, when nothing changed, stay at
-        // today's single cheap labels/INBOX call. When it does change,
-        // this is exactly the moment the user is most likely to open
-        // the popup next, so refreshing right away means it paints from
-        // an already-current cache instead of a stale one.
-        if (cached_len == count) break :opportunistic_refresh;
-
+    } else refresh: {
+        // While anything is unread, refresh the list and previews on every
+        // poll. This used to happen only when the unread count differed
+        // from the number of cached entries, which was both too little
+        // and too much: with more unread than `max_messages` the cache
+        // could never match the count (so it refetched every poll anyway),
+        // and one message read plus one new one left the count unchanged
+        // and the previews stale. Refreshing unconditionally keeps the
+        // cache the popup opens from at most one poll interval old. The
+        // cost is one list call plus up to `max_messages` preview calls per
+        // poll, over a single connection.
         const cfg = config.load(gpa, io, dirs.config_dir);
         const entries = messages_cache.fetchFromApi(gpa, &gmail_client, access_token, cfg.max_messages) catch |err| {
-            std.debug.print("waybar-gmail status: opportunistic refresh failed: {t}\n", .{err});
-            break :opportunistic_refresh;
+            std.debug.print("waybar-gmail status: refresh failed: {t}\n", .{err});
+            break :refresh;
         };
         defer messages_cache.freeEntries(gpa, entries);
+
+        // Unread mail exists (count > 0) but not one preview came back --
+        // every per-message fetch failed. Don't let that wipe a good cache
+        // and blank the tooltip; keep what's there (the fallbacks below).
+        if (entries.len == 0) {
+            std.debug.print("waybar-gmail status: refresh returned no previews for {d} unread, keeping the cache\n", .{count});
+            break :refresh;
+        }
 
         messages_cache.save(gpa, io, dirs.state_dir, entries) catch |err| {
             std.debug.print("waybar-gmail status: couldn't save message cache: {t}\n", .{err});
         };
         const lines = messages_cache.buildTooltipLines(gpa, entries) catch |err| {
             std.debug.print("waybar-gmail status: couldn't build tooltip lines: {t}\n", .{err});
-            break :opportunistic_refresh;
+            break :refresh;
         };
         saveTooltipCache(gpa, io, dirs.state_dir, lines) catch |err| {
             std.debug.print("waybar-gmail status: couldn't save tooltip cache: {t}\n", .{err});
@@ -396,7 +397,7 @@ test "loadTooltipLines returns null on malformed cache content" {
 
 test "genericTooltip differs sensibly by class" {
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("Inbox zero", genericTooltip(&buf, .read, 0));
+    try testing.expectEqualStrings("No unread messages", genericTooltip(&buf, .read, 0));
     try testing.expectEqualStrings("1 unread message", genericTooltip(&buf, .unread, 1));
     try testing.expectEqualStrings("5 unread messages", genericTooltip(&buf, .unread, 5));
     try testing.expect(std.mem.indexOf(u8, genericTooltip(&buf, .unauthenticated, 0), "auth") != null);

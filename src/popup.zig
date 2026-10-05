@@ -126,6 +126,12 @@ const AppState = struct {
     /// leaving it scheduled would fire 500ms later against an AppState
     /// that closePopup already freed.
     hover_close_timer: ?c.guint = null,
+    /// The pending resizeToFitContentCb timeout source, if one is scheduled
+    /// (see scheduleResize). Tracked for the same reason as
+    /// `hover_close_timer`: an action that empties the list closes the
+    /// popup, and a resize queued by an earlier action must not fire
+    /// afterwards against the AppState closePopup freed.
+    resize_timer: ?c.guint = null,
 
     fn deinit(self: *AppState) void {
         for (self.messages.items) |*m| m.deinit(self.gpa);
@@ -141,9 +147,9 @@ const AppState = struct {
 // ---- structured message cache (read: instant open; write: after every refresh/action) ----
 //
 // Both the cache file format and the fetch-from-Gmail logic live in
-// messages_cache.zig, shared with status.zig's opportunistic refresh
-// (see its own doc comment) -- this file only adds the GTK-specific
-// `row` field on top via CachedMessage.
+// messages_cache.zig, shared with status.zig's per-poll refresh (see its
+// own doc comment) -- this file only adds the GTK-specific `row` field on
+// top via CachedMessage.
 
 fn loadMessagesCache(gpa: Allocator, io: Io, dir: Dir) ?std.ArrayList(CachedMessage) {
     var entries = messages_cache.load(gpa, io, dir) orelse return null;
@@ -294,9 +300,13 @@ const PendingActionContext = struct {
 
 fn performActionDeferredCb(user_data: c.gpointer) callconv(.c) c.gboolean {
     const ctx: *PendingActionContext = @ptrCast(@alignCast(user_data.?));
+    // performAction can close the popup (the last message was removed),
+    // which frees the AppState `ctx.app` points at -- so the allocator has
+    // to be read out before the call, not through `ctx.app` after it.
+    const gpa = ctx.app.gpa;
     performAction(ctx.app, ctx.message_id, ctx.kind);
-    ctx.app.gpa.free(ctx.message_id);
-    ctx.app.gpa.destroy(ctx);
+    gpa.free(ctx.message_id);
+    gpa.destroy(ctx);
     return 0; // G_SOURCE_REMOVE: one-shot
 }
 
@@ -446,7 +456,7 @@ fn updateHeader(app: *AppState, text: []const u8) void {
 
 fn updateHeaderForCount(app: *AppState, count: usize) void {
     switch (count) {
-        0 => updateHeader(app, "Gmail — Inbox zero"),
+        0 => updateHeader(app, "Gmail — No unread messages"),
         1 => updateHeader(app, "Gmail — 1 unread"),
         else => {
             const text = std.fmt.allocPrint(app.gpa, "Gmail — {d} unread", .{count}) catch return;
@@ -534,7 +544,16 @@ fn populateListFromMessages(app: *AppState) void {
     // one main-loop iteration via g_timeout_add(1, ...), by which point
     // the queued resize has been processed and the preferred height is
     // real.
-    _ = c.g_timeout_add(1, resizeToFitContentCb, app);
+    scheduleResize(app);
+}
+
+/// Queues resizeToFitContentCb for the next main-loop iteration, unless one
+/// is already queued (it measures the content when it runs, so a second
+/// request before then has nothing to add). The source id is kept so
+/// closePopup can cancel it.
+fn scheduleResize(app: *AppState) void {
+    if (app.resize_timer != null) return;
+    app.resize_timer = c.g_timeout_add(1, resizeToFitContentCb, app);
 }
 
 fn layerEdge(edge: placement.Edge) c.GtkLayerShellEdge {
@@ -568,6 +587,7 @@ fn applyPlacement(app: *AppState, popup_height: c.gint) void {
 
 fn resizeToFitContentCb(user_data: c.gpointer) callconv(.c) c.gboolean {
     const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    app.resize_timer = null; // this source is removed on return regardless
 
     // gtk_widget_set_size_request below makes the size request a *minimum*
     // the window's preferred height can never go under, so measuring with
@@ -645,12 +665,22 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     persistCaches(app);
     notifyWaybar(app.io);
 
-    // Deliberately does not close the popup when the list empties: it
-    // used to, and that closed the window out from under the user after
-    // a single action -- reported live as "should stay open to allow
-    // several actions to be done at once". The window now stays open
-    // showing "Inbox zero" until the user dismisses it themselves
-    // (Escape, hover-leave, or clicking the module again).
+    // The last message is gone: nothing left to act on, so close. This
+    // only happens once the list is really empty -- an earlier version
+    // closed the window after a *single* action, which was reported live
+    // as "should stay open to allow several actions to be done at once",
+    // and that is still the behavior whenever anything remains (the 5-row
+    // cap only limits what's shown; buffered messages count as remaining).
+    //
+    // closePopup frees `app`, so nothing below may touch it, and neither
+    // may the caller: see performActionDeferredCb. A popup that is merely
+    // *opened* on an empty inbox does not go through here and stays open
+    // showing "No unread messages".
+    if (app.messages.items.len == 0) {
+        closePopup(app);
+        return;
+    }
+
     updateHeaderCount(app);
 
     // The row is already gone (destroyed optimistically by
@@ -662,7 +692,7 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     // row's worth too tall, after every single action. (While more than
     // `max_visible_rows` messages remain, the refill keeps the height
     // identical and resizeToFitContentCb returns without touching anything.)
-    _ = c.g_timeout_add(1, resizeToFitContentCb, app);
+    scheduleResize(app);
 }
 
 fn refreshTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
@@ -723,6 +753,13 @@ fn closePopup(app: *AppState) void {
     if (app.hover_close_timer) |id| {
         _ = c.g_source_remove(id);
         app.hover_close_timer = null;
+    }
+    // Same for a queued resize: e.g. two quick actions on the last two
+    // messages, the first of which queued a resize, the second of which
+    // emptied the list and closed the popup.
+    if (app.resize_timer) |id| {
+        _ = c.g_source_remove(id);
+        app.resize_timer = null;
     }
     clearListBox(app);
     c.gtk_widget_destroy(@ptrCast(app.window));

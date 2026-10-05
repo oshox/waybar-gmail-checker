@@ -13,11 +13,14 @@ found along the way.
 ## How it's built
 
 - **`waybar-gmail`** -- fully static (musl), zero dynamic linking. This is
-  what waybar re-runs on every poll interval, so its only job is to make
-  one cheap Gmail API call and print a JSON status line; it never links
-  GTK.
+  what waybar re-runs on every poll interval. Each run makes the cheap
+  unread-count call and prints a JSON status line; while anything is
+  unread it also refreshes the message previews (one list call plus up to
+  `max_messages` preview calls), so the tooltip and the popup always start
+  from a cache at most one poll interval old. It never links GTK.
 - **`waybar-gmail-popup`** -- native, links GTK3 + gtk-layer-shell. Spawned
-  only when you click the module.
+  only when you click the module. It shows at most 5 messages at a time
+  and closes itself when the last one is removed.
 
 ## Setup
 
