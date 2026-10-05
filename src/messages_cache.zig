@@ -34,6 +34,42 @@ pub fn freeEntries(gpa: Allocator, entries: []Entry) void {
     gpa.free(entries);
 }
 
+/// Builds an Entry that owns copies of all five strings. If any copy fails,
+/// the ones already made are freed (an inline struct literal full of
+/// `try gpa.dupe(...)` would leak them).
+fn makeEntry(
+    gpa: Allocator,
+    id: []const u8,
+    thread_id: []const u8,
+    from: []const u8,
+    subject: []const u8,
+    snippet: []const u8,
+) Allocator.Error!Entry {
+    const id_copy = try gpa.dupe(u8, id);
+    errdefer gpa.free(id_copy);
+    const thread_copy = try gpa.dupe(u8, thread_id);
+    errdefer gpa.free(thread_copy);
+    const from_copy = try gpa.dupe(u8, from);
+    errdefer gpa.free(from_copy);
+    const subject_copy = try gpa.dupe(u8, subject);
+    errdefer gpa.free(subject_copy);
+    const snippet_copy = try gpa.dupe(u8, snippet);
+    return .{
+        .id = id_copy,
+        .thread_id = thread_copy,
+        .from = from_copy,
+        .subject = subject_copy,
+        .snippet = snippet_copy,
+    };
+}
+
+fn findKnown(known: []const Entry, id: []const u8) ?*const Entry {
+    for (known) |*k| {
+        if (std.mem.eql(u8, k.id, id)) return k;
+    }
+    return null;
+}
+
 const EntryJson = struct {
     id: []const u8,
     thread_id: []const u8,
@@ -45,13 +81,24 @@ const EntryJson = struct {
 const cache_file = "messages.json";
 const max_cache_size = 256 * 1024;
 
-/// Fetches the current unread list and each message's preview: one
-/// listUnread call plus one getPreview call per message, all
-/// sequential -- deliberately not parallelized, see popup.zig's
-/// fetchMessages for the history there. Skips (rather than failing
-/// outright) any single message whose preview fetch fails, so one bad
-/// message doesn't blank the whole list.
-pub fn fetchFromApi(gpa: Allocator, client: *http.Client, access_token: []const u8, max_messages: u32) ![]Entry {
+/// Fetches the current unread list and a preview of each message. The list
+/// is always fetched fresh (it's what says which messages are still unread),
+/// but a message's preview -- sender, subject, snippet -- never changes, so
+/// any id already present in `known` (the previous cache) is reused as is
+/// and only ids not seen before cost a getPreview call. A poll where
+/// nothing new arrived is therefore one list call, not one plus a preview
+/// per message. Pass `&.{}` to force every preview to be fetched.
+///
+/// Sequential on purpose (see popup.zig's fetchMessages for the history
+/// there). Skips, rather than failing outright, any single message whose
+/// preview fetch fails, so one bad message doesn't blank the whole list.
+pub fn fetchFromApi(
+    gpa: Allocator,
+    client: *http.Client,
+    access_token: []const u8,
+    max_messages: u32,
+    known: []const Entry,
+) ![]Entry {
     const refs = try gmail.listUnread(gpa, client, access_token, max_messages);
     defer gmail.freeMessageRefs(gpa, refs);
 
@@ -62,15 +109,15 @@ pub fn fetchFromApi(gpa: Allocator, client: *http.Client, access_token: []const 
     }
 
     for (refs) |ref| {
+        if (findKnown(known, ref.id)) |k| {
+            try out.ensureUnusedCapacity(gpa, 1);
+            out.appendAssumeCapacity(try makeEntry(gpa, ref.id, ref.thread_id, k.from, k.subject, k.snippet));
+            continue;
+        }
         var preview = gmail.getPreview(gpa, client, access_token, ref.id) catch continue;
         defer preview.deinit(gpa);
-        try out.append(gpa, .{
-            .id = try gpa.dupe(u8, ref.id),
-            .thread_id = try gpa.dupe(u8, ref.thread_id),
-            .from = try gpa.dupe(u8, preview.from),
-            .subject = try gpa.dupe(u8, preview.subject),
-            .snippet = try gpa.dupe(u8, preview.snippet),
-        });
+        try out.ensureUnusedCapacity(gpa, 1);
+        out.appendAssumeCapacity(try makeEntry(gpa, ref.id, ref.thread_id, preview.from, preview.subject, preview.snippet));
     }
     return out.toOwnedSlice(gpa);
 }
@@ -86,6 +133,28 @@ pub fn save(gpa: Allocator, io: Io, dir: Dir, entries: []const Entry) !void {
     defer out.deinit();
     try std.json.Stringify.value(list.items, .{}, &out.writer);
     try cache.atomicWrite(dir, io, cache_file, out.written(), cache.private_file_permissions);
+}
+
+/// How old the cache file may be and still be trusted as current. The 60s
+/// status poll rewrites it on every run while anything is unread, so with
+/// the default waybar interval its age never exceeds about a minute; the
+/// extra headroom absorbs a slow poll without making the popup refetch.
+pub const fresh_max_age_ms: i64 = 90_000;
+
+/// Pure age check. A negative age means the file's mtime is in the future
+/// (the clock was set back) -- that is not "fresh", it's "can't tell".
+pub fn isFreshAge(now_ms: i64, mtime_ms: i64, max_age_ms: i64) bool {
+    const age = now_ms - mtime_ms;
+    return age >= 0 and age <= max_age_ms;
+}
+
+/// Whether the cache file was written recently enough that the popup can
+/// paint from it and skip its own network refresh. A missing or unreadable
+/// file is simply "not fresh".
+pub fn isFresh(io: Io, dir: Dir, max_age_ms: i64) bool {
+    const st = dir.statFile(io, cache_file, .{}) catch return false;
+    const now = Io.Timestamp.now(io, .real);
+    return isFreshAge(now.toMilliseconds(), st.mtime.toMilliseconds(), max_age_ms);
 }
 
 /// Returns null if there's no cache yet or it's unreadable/malformed --
@@ -112,10 +181,33 @@ pub fn load(gpa: Allocator, io: Io, dir: Dir) ?std.ArrayList(Entry) {
     return out;
 }
 
+/// A tooltip line longer than this is cut short with an ellipsis. Subjects
+/// can be kilobytes long (the fixtures include a ~1.9KB one on purpose), and
+/// a tooltip as wide as the screen is no use to anyone.
+pub const max_tooltip_line_chars = 100;
+
+/// The longest prefix of `text` with at most `max_chars` Unicode code points,
+/// cut on a character boundary so the result is still valid UTF-8. `text`
+/// itself if it already fits (or isn't valid UTF-8 at all, in which case it
+/// is left alone rather than guessed at).
+fn truncateUtf8(text: []const u8, max_chars: usize) []const u8 {
+    var it = (std.unicode.Utf8View.init(text) catch return text).iterator();
+    var chars: usize = 0;
+    var end: usize = 0;
+    while (it.nextCodepointSlice()) |slice| {
+        if (chars == max_chars) return text[0..end];
+        chars += 1;
+        end += slice.len;
+    }
+    return text;
+}
+
 /// Builds the tooltip's per-message lines ("From — Subject") from
 /// fetched entries -- the same format the popup has always written via
 /// persistCaches, kept in one place so the two call sites can't drift
-/// apart. Caller owns the result: free each line, then the slice.
+/// apart. Lines longer than `max_tooltip_line_chars` are shortened here
+/// only: the cache keeps the full text for the popup. Caller owns the
+/// result: free each line, then the slice.
 pub fn buildTooltipLines(gpa: Allocator, entries: []const Entry) ![][]u8 {
     var lines: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -123,8 +215,21 @@ pub fn buildTooltipLines(gpa: Allocator, entries: []const Entry) ![][]u8 {
         lines.deinit(gpa);
     }
     for (entries) |e| {
-        const line = try std.fmt.allocPrint(gpa, "{s} — {s}", .{ e.from, e.subject });
-        try lines.append(gpa, line);
+        const full = try std.fmt.allocPrint(gpa, "{s} — {s}", .{ e.from, e.subject });
+        const short = truncateUtf8(full, max_tooltip_line_chars);
+        if (short.len == full.len) {
+            lines.append(gpa, full) catch |err| {
+                gpa.free(full);
+                return err;
+            };
+            continue;
+        }
+        defer gpa.free(full);
+        const line = try std.fmt.allocPrint(gpa, "{s}…", .{short});
+        lines.append(gpa, line) catch |err| {
+            gpa.free(line);
+            return err;
+        };
     }
     return lines.toOwnedSlice(gpa);
 }
@@ -167,6 +272,24 @@ test "save then load round-trips entries" {
     try testing.expectEqualStrings("Bob <b@example.com>", loaded.items[1].from);
 }
 
+test "isFreshAge: recent is fresh, old is stale, a future mtime is not trusted" {
+    try testing.expect(isFreshAge(100_000, 100_000, 90_000)); // just written
+    try testing.expect(isFreshAge(100_000, 40_000, 90_000)); // 60s old
+    try testing.expect(isFreshAge(190_000, 100_000, 90_000)); // exactly the limit
+    try testing.expect(!isFreshAge(190_001, 100_000, 90_000)); // one ms over
+    try testing.expect(!isFreshAge(100_000, 100_001, 90_000)); // mtime in the future
+}
+
+test "isFresh is true for a cache just written and false when there is none" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expect(!isFresh(testing.io, tmp.dir, fresh_max_age_ms));
+
+    try save(testing.allocator, testing.io, tmp.dir, &.{});
+    try testing.expect(isFresh(testing.io, tmp.dir, fresh_max_age_ms));
+}
+
 test "load returns null when no cache exists yet" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -207,11 +330,99 @@ test "fetchFromApi fetches list and previews via fixtures" {
     defer client.deinit();
     defer testing.allocator.free(client.mode.fixture);
 
-    const entries = try fetchFromApi(testing.allocator, &client, "token", 15);
+    const entries = try fetchFromApi(testing.allocator, &client, "token", 15, &.{});
     defer freeEntries(testing.allocator, entries);
 
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqualStrings("m1", entries[0].id);
     try testing.expectEqualStrings("GitHub", entries[0].from);
     try testing.expectEqualStrings("PR merged", entries[0].subject);
+}
+
+test "fetchFromApi reuses known previews and only fetches unseen ids" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The list has m1 (already cached) and m2 (new). Only m2 has a preview
+    // fixture: if m1's preview were fetched again the fixture lookup would
+    // fail and m1 would be skipped, so m1 appearing proves it came from `known`.
+    try writeFixture(tmp.dir, "messages_list.json",
+        \\{"status": 200, "body": {"messages": [{"id": "m2", "threadId": "t2"}, {"id": "m1", "threadId": "t1"}]}}
+    );
+    try writeFixture(tmp.dir, "messages/m2.json",
+        \\{"status": 200, "body": {"payload": {"headers": [{"name": "From", "value": "New Sender"}, {"name": "Subject", "value": "Fresh"}]}, "snippet": "just arrived"}}
+    );
+
+    var client = try fixtureClient(tmp.dir);
+    defer client.deinit();
+    defer testing.allocator.free(client.mode.fixture);
+
+    const known = [_]Entry{
+        .{ .id = "m1", .thread_id = "t1", .from = "Cached Sender", .subject = "Cached subject", .snippet = "CACHED SNIPPET" },
+        // Cached but no longer unread: must not reappear.
+        .{ .id = "gone", .thread_id = "tg", .from = "x", .subject = "x", .snippet = "x" },
+    };
+    const entries = try fetchFromApi(testing.allocator, &client, "token", 15, &known);
+    defer freeEntries(testing.allocator, entries);
+
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    // Order follows the fresh list, not the cache.
+    try testing.expectEqualStrings("m2", entries[0].id);
+    try testing.expectEqualStrings("Fresh", entries[0].subject);
+    try testing.expectEqualStrings("m1", entries[1].id);
+    try testing.expectEqualStrings("Cached Sender", entries[1].from);
+    try testing.expectEqualStrings("CACHED SNIPPET", entries[1].snippet);
+}
+
+test "fetchFromApi still skips a new message whose preview fails" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFixture(tmp.dir, "messages_list.json",
+        \\{"status": 200, "body": {"messages": [{"id": "bad", "threadId": "tb"}]}}
+    );
+    // No messages/bad.json fixture at all.
+
+    var client = try fixtureClient(tmp.dir);
+    defer client.deinit();
+    defer testing.allocator.free(client.mode.fixture);
+
+    const entries = try fetchFromApi(testing.allocator, &client, "token", 15, &.{});
+    defer freeEntries(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "truncateUtf8 cuts on a character boundary" {
+    try testing.expectEqualStrings("abc", truncateUtf8("abcdef", 3));
+    try testing.expectEqualStrings("abcdef", truncateUtf8("abcdef", 6));
+    try testing.expectEqualStrings("abcdef", truncateUtf8("abcdef", 100));
+    try testing.expectEqualStrings("", truncateUtf8("abc", 0));
+    // 2-byte and 4-byte characters are never split.
+    try testing.expectEqualStrings("éé", truncateUtf8("ééé", 2));
+    try testing.expectEqualStrings("\u{1F600}\u{1F600}", truncateUtf8("\u{1F600}\u{1F600}\u{1F600}", 2));
+    // Not valid UTF-8: left alone rather than cut at a guess.
+    try testing.expectEqualStrings("\xff\xfeabc", truncateUtf8("\xff\xfeabc", 1));
+}
+
+test "buildTooltipLines shortens very long lines but not short ones" {
+    const long_subject = "x" ** 500;
+    const accented = "é" ** 300;
+    const entries = [_]Entry{
+        .{ .id = "1", .thread_id = "t", .from = "A", .subject = "short", .snippet = "" },
+        .{ .id = "2", .thread_id = "t", .from = "B", .subject = long_subject, .snippet = "" },
+        .{ .id = "3", .thread_id = "t", .from = "C", .subject = accented, .snippet = "" },
+    };
+    const lines = try buildTooltipLines(testing.allocator, &entries);
+    defer {
+        for (lines) |l| testing.allocator.free(l);
+        testing.allocator.free(lines);
+    }
+    try testing.expectEqualStrings("A — short", lines[0]);
+
+    // 100 characters then the ellipsis (3 bytes).
+    try testing.expect(std.mem.endsWith(u8, lines[1], "…"));
+    try testing.expectEqual(@as(usize, 100 + "…".len), lines[1].len);
+
+    try testing.expect(std.unicode.utf8ValidateSlice(lines[2]));
+    try testing.expect(std.mem.endsWith(u8, lines[2], "…"));
+    const kept = lines[2][0 .. lines[2].len - "…".len];
+    try testing.expectEqual(@as(usize, 100), try std.unicode.utf8CountCodepoints(kept));
 }

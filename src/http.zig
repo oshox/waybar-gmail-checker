@@ -79,7 +79,9 @@ pub const Client = struct {
     }
 
     fn sendLive(self: *Client, http_client: *std.http.Client, req: Request) !Response {
+        // Holds the bearer token, so it's wiped when this function returns.
         var auth_buf: [4096]u8 = undefined;
+        defer std.crypto.secureZero(u8, &auth_buf);
         const auth_header = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{req.access_token});
 
         var extra_headers_buf: [2]std.http.Header = undefined;

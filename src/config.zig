@@ -53,18 +53,44 @@ pub fn openDirs(gpa: Allocator, io: Io, environ_map: *const std.process.Environ.
     return .{ .config_dir = config_dir, .config_path = config_path, .state_dir = state_dir, .state_path = state_path };
 }
 
+/// Upper bound for `max_messages`. Gmail itself allows far more per list
+/// call, but every message past the first costs a preview request the first
+/// time it's seen, and the popup only shows a handful at a time anyway.
+pub const max_messages_limit: u32 = 50;
+pub const default_max_messages: u32 = 15;
+
 pub const Config = struct {
-    /// How many unread messages the popup fetches previews for.
-    max_messages: u32 = 15,
+    /// How many unread messages are listed and previewed (the cache the
+    /// popup and the tooltip are built from). Always within
+    /// 1..max_messages_limit.
+    max_messages: u32 = default_max_messages,
     /// Gap between a first and second click that counts as a double-click
     /// (see click.zig, M4).
     double_click_ms: u32 = 350,
+    /// Which signed-in Google account to open messages in: the N in
+    /// mail.google.com/mail/u/N/. 0 is the browser's first signed-in
+    /// account, which is right unless Gmail opens the wrong mailbox for you.
+    account_index: u32 = 0,
+    /// The popup closes itself this long after opening if the pointer never
+    /// enters it (so one you opened and walked away from doesn't sit on
+    /// screen forever). 0 disables.
+    idle_close_ms: u32 = 5000,
 };
 
 const JsonShape = struct {
     max_messages: ?u32 = null,
     double_click_ms: ?u32 = null,
+    account_index: ?u32 = null,
+    idle_close_ms: ?u32 = null,
 };
+
+/// 0 is invalid (Gmail would answer a maxResults of 0 with its own default
+/// of 100, i.e. 100 preview requests), so it falls back to the default;
+/// anything above the limit is capped.
+pub fn normalizeMaxMessages(v: u32) u32 {
+    if (v == 0) return default_max_messages;
+    return @min(v, max_messages_limit);
+}
 
 const max_config_file_size = 16 * 1024;
 
@@ -82,8 +108,10 @@ pub fn load(gpa: Allocator, io: Io, dir: Dir) Config {
     defer parsed.deinit();
 
     var cfg: Config = .{};
-    if (parsed.value.max_messages) |v| cfg.max_messages = v;
+    if (parsed.value.max_messages) |v| cfg.max_messages = normalizeMaxMessages(v);
     if (parsed.value.double_click_ms) |v| cfg.double_click_ms = v;
+    if (parsed.value.account_index) |v| cfg.account_index = v;
+    if (parsed.value.idle_close_ms) |v| cfg.idle_close_ms = v;
     return cfg;
 }
 
@@ -147,6 +175,38 @@ test "load falls back to defaults on malformed JSON" {
     const cfg = load(testing.allocator, testing.io, tmp.dir);
     try testing.expectEqual(@as(u32, 15), cfg.max_messages);
     try testing.expectEqual(@as(u32, 350), cfg.double_click_ms);
+}
+
+test "normalizeMaxMessages: 0 falls back to the default, huge values are capped" {
+    try testing.expectEqual(@as(u32, 15), normalizeMaxMessages(0));
+    try testing.expectEqual(@as(u32, 1), normalizeMaxMessages(1));
+    try testing.expectEqual(@as(u32, 50), normalizeMaxMessages(50));
+    try testing.expectEqual(@as(u32, 50), normalizeMaxMessages(51));
+    try testing.expectEqual(@as(u32, 50), normalizeMaxMessages(4_000_000_000));
+}
+
+test "load clamps an out-of-range max_messages" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"max_messages\": 500}" });
+    try testing.expectEqual(@as(u32, 50), load(testing.allocator, testing.io, tmp.dir).max_messages);
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"max_messages\": 0}" });
+    try testing.expectEqual(@as(u32, 15), load(testing.allocator, testing.io, tmp.dir).max_messages);
+}
+
+test "load reads account_index and idle_close_ms, with defaults when absent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const defaults = load(testing.allocator, testing.io, tmp.dir);
+    try testing.expectEqual(@as(u32, 0), defaults.account_index);
+    try testing.expectEqual(@as(u32, 5000), defaults.idle_close_ms);
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"account_index\": 2, \"idle_close_ms\": 0}" });
+    const cfg = load(testing.allocator, testing.io, tmp.dir);
+    try testing.expectEqual(@as(u32, 2), cfg.account_index);
+    try testing.expectEqual(@as(u32, 0), cfg.idle_close_ms);
 }
 
 test "load ignores unknown fields instead of failing" {

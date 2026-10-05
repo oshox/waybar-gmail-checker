@@ -85,6 +85,13 @@ const AppState = struct {
     config_dir: Dir,
     state_dir: Dir,
     access_token: []u8,
+    /// config.json, read once at startup.
+    cfg: config.Config,
+    /// The inbox's real unread total, which can exceed what's listed
+    /// (`messages` holds at most `cfg.max_messages`). Read from the cache the
+    /// status poll writes, refreshed on a network refresh, and decremented
+    /// as messages are removed. Null until known.
+    unread_total: ?u32 = null,
     gtk_app: *c.GtkApplication,
     window: *c.GtkWindow,
     list_box: *c.GtkWidget,
@@ -177,7 +184,7 @@ fn persistCaches(app: *AppState) void {
         for (lines) |l| app.gpa.free(l);
         app.gpa.free(lines);
     }
-    status.saveTooltipCache(app.gpa, app.io, app.state_dir, lines) catch |err| {
+    status.saveTooltipCache(app.gpa, app.io, app.state_dir, lines, unreadTotal(app)) catch |err| {
         std.debug.print("waybar-gmail-popup: couldn't save tooltip cache: {t}\n", .{err});
     };
 }
@@ -227,7 +234,14 @@ fn fetchMessages(app: *AppState) ![]CachedMessage {
     var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
     defer client.deinit();
 
-    const entries = try messages_cache.fetchFromApi(app.gpa, &client, app.access_token, 15);
+    // Previews already in the list are reused (fetchFromApi only asks Gmail
+    // about message ids it hasn't seen). The shallow copy is just so the
+    // list of Entry values can be passed along; nothing in it is freed here.
+    var known: std.ArrayList(messages_cache.Entry) = .empty;
+    defer known.deinit(app.gpa);
+    for (app.messages.items) |m| try known.append(app.gpa, m.data);
+
+    const entries = try messages_cache.fetchFromApi(app.gpa, &client, app.access_token, app.cfg.max_messages, known.items);
     // Each entry's string data is moved (by value -- just the slice
     // pointers) into `out` below, so only the now-empty outer array
     // needs freeing here, not messages_cache.freeEntries.
@@ -361,7 +375,7 @@ const OpenContext = struct {
 fn onRowClicked(_: *c.GtkWidget, _: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
     const ctx: *OpenContext = @ptrCast(@alignCast(user_data.?));
     var buf: [512]u8 = undefined;
-    const url = std.fmt.bufPrint(&buf, "https://mail.google.com/mail/u/0/#inbox/{s}", .{ctx.thread_id}) catch return 0;
+    const url = gmail.messageUrl(&buf, ctx.app.cfg.account_index, ctx.thread_id) catch return 0;
     oauth.openInBrowser(ctx.app.io, url) catch |err| {
         std.debug.print("waybar-gmail-popup: couldn't open message: {t}\n", .{err});
     };
@@ -466,8 +480,17 @@ fn updateHeaderForCount(app: *AppState, count: usize) void {
     }
 }
 
+/// How many unread messages the inbox has, as far as we know: the recorded
+/// total, but never less than what's actually listed (a stale total can lag
+/// behind the list). The list holds at most `cfg.max_messages`, so counting
+/// it alone would say "15 unread" for a 28-message inbox.
+fn unreadTotal(app: *const AppState) u32 {
+    const listed: u32 = @intCast(app.messages.items.len);
+    return @max(app.unread_total orelse listed, listed);
+}
+
 fn updateHeaderCount(app: *AppState) void {
-    updateHeaderForCount(app, app.messages.items.len);
+    updateHeaderForCount(app, unreadTotal(app));
 }
 
 /// Destroys every row widget currently in the list box (each one's
@@ -642,10 +665,17 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
     defer client.deinit();
 
-    const result = switch (kind) {
-        .mark_read => gmail.markRead(app.gpa, &client, app.access_token, message_id),
-        .archive => gmail.archive(app.gpa, &client, app.access_token, message_id),
-        .trash => gmail.trash(app.gpa, &client, app.access_token, message_id),
+    // The token is checked before every action, not just once at startup: a
+    // popup left open past the access token's life (about an hour) used to
+    // fail every action with 401 until it was reopened. When the cached
+    // token is still good this is one small file read.
+    const result: anyerror!void = blk: {
+        ensureFreshToken(app) catch |err| break :blk err;
+        break :blk switch (kind) {
+            .mark_read => gmail.markRead(app.gpa, &client, app.access_token, message_id),
+            .archive => gmail.archive(app.gpa, &client, app.access_token, message_id),
+            .trash => gmail.trash(app.gpa, &client, app.access_token, message_id),
+        };
     };
 
     result catch |err| {
@@ -661,6 +691,9 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     var removed = app.messages.orderedRemove(idx);
     if (removed.row) |row| destroyRow(row);
     removed.deinit(app.gpa);
+    // One fewer unread (archive and trash both leave the inbox; mark-read
+    // clears UNREAD). Saturating, since the recorded total can be stale.
+    if (app.unread_total) |t| app.unread_total = t -| 1;
     fillVisibleRows(app); // normally a no-op: onActionClicked already refilled
     persistCaches(app);
     notifyWaybar(app.io);
@@ -695,27 +728,61 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     scheduleResize(app);
 }
 
+/// Makes sure `app.access_token` is valid, refreshing it if the cached one is
+/// near expiry. When it isn't, this is one small file read. Called before
+/// anything that talks to the API -- the refresh on open, and every action.
+fn ensureFreshToken(app: *AppState) !void {
+    var http_client: std.http.Client = .{ .allocator = app.gpa, .io = app.io };
+    defer http_client.deinit();
+    const new_token = try oauth.getValidAccessToken(app.gpa, app.io, &http_client, app.creds, app.state_dir);
+    oauth.secureFree(app.gpa, app.access_token);
+    app.access_token = new_token;
+}
+
+/// The inbox's real unread total (one cheap call), or null if it couldn't be
+/// read -- the list is capped at `max_messages`, so it can't tell us.
+fn fetchUnreadTotal(app: *AppState) ?u32 {
+    var client = http.Client.initFromEnv(app.gpa, app.io, app.environ_map);
+    defer client.deinit();
+    return gmail.getUnreadCount(app.gpa, &client, app.access_token) catch |err| {
+        std.debug.print("waybar-gmail-popup: couldn't read the unread count: {t}\n", .{err});
+        return null;
+    };
+}
+
+/// A refresh failed. If nothing is on screen from the cache either, say so:
+/// otherwise the header sits on "loading…" forever. With cached content
+/// showing it's left alone -- slightly stale beats blank.
+fn showLoadFailure(app: *AppState, err: anyerror) void {
+    if (app.messages.items.len != 0) return;
+    updateHeader(app, switch (err) {
+        error.NotAuthenticated, error.Unauthorized => "Gmail — not signed in (run: waybar-gmail auth)",
+        error.RateLimited => "Gmail — rate limited, try again shortly",
+        else => "Gmail — couldn't load (check your connection)",
+    });
+}
+
 fn refreshTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
     const app: *AppState = @ptrCast(@alignCast(user_data.?));
 
-    var http_client: std.http.Client = .{ .allocator = app.gpa, .io = app.io };
-    const new_token = oauth.getValidAccessToken(app.gpa, app.io, &http_client, app.creds, app.state_dir) catch |err| {
-        http_client.deinit();
+    ensureFreshToken(app) catch |err| {
         std.debug.print("waybar-gmail-popup: token refresh failed: {t}\n", .{err});
+        showLoadFailure(app, err);
         return 0; // G_SOURCE_REMOVE -- keep whatever cached content was already shown
     };
-    http_client.deinit();
-    oauth.secureFree(app.gpa, app.access_token);
-    app.access_token = new_token;
+
+    const total = fetchUnreadTotal(app);
 
     const fetched = fetchMessages(app) catch |err| {
         std.debug.print("waybar-gmail-popup: refresh failed: {t}\n", .{err});
+        showLoadFailure(app, err);
         return 0; // G_SOURCE_REMOVE -- keep whatever was already shown (cache or empty)
     };
 
     for (app.messages.items) |*m| m.deinit(app.gpa);
     app.messages.deinit(app.gpa);
     app.messages = .fromOwnedSlice(fetched);
+    if (total) |t| app.unread_total = t;
 
     populateListFromMessages(app);
     persistCaches(app);
@@ -857,11 +924,20 @@ fn setupAppState(init_data: std.process.Init, gtk_app: *c.GtkApplication) !*AppS
     // and this function runs before any widget exists. Doing that here
     // blocked window creation on network I/O -- confirmed live, the
     // window did not appear for several seconds while this refreshed.
-    // The real token is fetched in `refreshTimeoutCb`, which runs via
-    // `g_timeout_add` *after* `gtk_widget_show_all`, so the window is on
-    // screen (with cached content, if any) before any network call.
+    // The real token is fetched by `ensureFreshToken`: in `refreshTimeoutCb`
+    // (which runs via `g_timeout_add` *after* `gtk_widget_show_all`, so the
+    // window is on screen with cached content before any network call) and
+    // again before every action, so a popup left open past the token's
+    // lifetime keeps working.
     const access_token = try gpa.alloc(u8, 0);
     errdefer gpa.free(access_token);
+
+    // Infallible: a missing or broken config.json just means defaults.
+    const cfg = config.load(gpa, io, dirs.config_dir);
+    // The inbox total the status poll last recorded, so the header can show
+    // it immediately; null (header falls back to the listed count) if the
+    // poll hasn't run yet.
+    const unread_total = status.loadUnreadCount(gpa, io, dirs.state_dir);
 
     const app = try gpa.create(AppState);
 
@@ -880,6 +956,8 @@ fn setupAppState(init_data: std.process.Init, gtk_app: *c.GtkApplication) !*AppS
         .config_dir = dirs.config_dir,
         .state_dir = dirs.state_dir,
         .access_token = access_token,
+        .cfg = cfg,
+        .unread_total = unread_total,
         .gtk_app = gtk_app,
         .window = undefined,
         .list_box = undefined,
@@ -1137,8 +1215,9 @@ fn showPopup(app: *AppState) void {
     // enter/leave-notify below are a different event class -- pointer
     // crossings tied to actual mouse movement, not keyboard focus
     // negotiation -- and don't share that failure mode. Closing overall
-    // is handled by: Escape, this hover-leave timeout, or clicking the
-    // module again (click.zig already toggles an open popup closed).
+    // is handled by: Escape, this hover-leave timeout, the idle timeout
+    // below (for a popup the pointer never enters), or clicking the module
+    // again (click.zig already toggles an open popup closed).
     c.gtk_widget_add_events(window_widget, c.GDK_ENTER_NOTIFY_MASK | c.GDK_LEAVE_NOTIFY_MASK);
     _ = c.g_signal_connect_data(window, "enter-notify-event", @ptrCast(&onWindowEnter), app, null, 0);
     _ = c.g_signal_connect_data(window, "leave-notify-event", @ptrCast(&onWindowLeave), app, null, 0);
@@ -1148,17 +1227,37 @@ fn showPopup(app: *AppState) void {
 
     // Paint from the structured cache immediately, if one exists, so the
     // window has real content the instant it appears.
+    var cache_is_fresh = false;
     if (loadMessagesCache(app.gpa, app.io, app.state_dir)) |cached| {
         app.messages = cached;
         populateListFromMessages(app);
+        cache_is_fresh = messages_cache.isFresh(app.io, app.state_dir, messages_cache.fresh_max_age_ms);
     } else {
         updateHeader(app, "Gmail — loading…");
     }
 
     c.gtk_widget_show_all(window_widget);
 
-    // Refresh from Gmail once the window is already on screen.
-    _ = c.g_timeout_add(1, refreshTimeoutCb, app);
+    // A popup nobody touches would otherwise sit on screen indefinitely:
+    // the hover-leave timer only starts once the pointer has entered and
+    // left, and this popup opens beside the pointer, not under it. Started
+    // here, cancelled the moment the pointer enters (onWindowEnter), and
+    // restarted by every leave as before.
+    if (app.cfg.idle_close_ms > 0) {
+        app.hover_close_timer = c.g_timeout_add(app.cfg.idle_close_ms, hoverCloseTimeoutCb, app);
+    }
+
+    // Refresh from Gmail once the window is already on screen -- unless the
+    // cache we just painted is fresh. The status poll rewrites it every
+    // minute while anything is unread, so it normally is, and the popup
+    // then opens instantly with no network round trip at all (the refresh
+    // runs on the GTK main thread, so while it ran the window couldn't be
+    // clicked, hovered or closed). It still happens when the cache is
+    // missing or stale, e.g. right after login or if the poll isn't running.
+    // Actions fetch their own fresh token (see performAction).
+    if (!cache_is_fresh) {
+        _ = c.g_timeout_add(1, refreshTimeoutCb, app);
+    }
 }
 
 pub fn run(init: std.process.Init) u8 {

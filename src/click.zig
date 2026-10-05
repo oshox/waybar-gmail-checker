@@ -21,9 +21,8 @@ const Dir = Io.Dir;
 const Allocator = std.mem.Allocator;
 const cache = @import("cache.zig");
 const config = @import("config.zig");
+const gmail = @import("gmail.zig");
 const oauth = @import("oauth.zig");
-
-pub const inbox_url = "https://mail.google.com/mail/u/0/#inbox";
 
 pub const State = struct {
     last_click_ms: i64 = 0,
@@ -66,6 +65,30 @@ pub fn isProcessAlive(pid: i32) bool {
 
 pub fn terminateProcess(pid: i32) void {
     std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+}
+
+/// What /proc/<pid>/comm holds for the popup: its name truncated to the
+/// kernel's 15-character limit ("waybar-gmail-popup" is 18).
+pub const popup_comm = "waybar-gmail-po";
+
+/// Whether the contents of a /proc/<pid>/comm file name the popup. Pure, so
+/// it's testable without a real process.
+pub fn isPopupComm(comm_file_contents: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trimEnd(u8, comm_file_contents, "\n"), popup_comm);
+}
+
+/// True if `pid` is alive *and* is the popup, not just some process that
+/// happens to have the number the popup once had. `isProcessAlive` alone
+/// can't tell: `kill(pid, 0)` succeeds for any process, and once the popup
+/// exits the kernel is free to hand its PID to something else -- at which
+/// point a toggle click would SIGTERM that unrelated process.
+pub fn isPopupProcess(io: Io, pid: i32) bool {
+    if (!isProcessAlive(pid)) return false;
+    var path_buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return false;
+    var buf: [64]u8 = undefined;
+    const contents = Dir.cwd().readFile(io, path, &buf) catch return false;
+    return isPopupComm(contents);
 }
 
 pub const Action = enum {
@@ -135,16 +158,21 @@ pub fn run(init: std.process.Init) u8 {
 
     const now_ms = Io.Timestamp.now(io, .awake).toMilliseconds();
     const state = loadState(gpa, io, dirs.state_dir);
-    const popup_alive = if (state.popup_pid) |pid| isProcessAlive(pid) else false;
+    const popup_alive = if (state.popup_pid) |pid| isPopupProcess(io, pid) else false;
     const action = decideAction(state, now_ms, popup_alive, @intCast(cfg.double_click_ms));
 
     var next_popup_pid: ?i32 = null;
     switch (action) {
         .close_popup_and_open_inbox => {
             if (popup_alive) terminateProcess(state.popup_pid.?);
-            oauth.openInBrowser(io, inbox_url) catch |err| {
-                std.debug.print("waybar-gmail click: couldn't open inbox: {t}\n", .{err});
-            };
+            var url_buf: [128]u8 = undefined;
+            if (gmail.inboxUrl(&url_buf, cfg.account_index)) |url| {
+                oauth.openInBrowser(io, url) catch |err| {
+                    std.debug.print("waybar-gmail click: couldn't open inbox: {t}\n", .{err});
+                };
+            } else |err| {
+                std.debug.print("waybar-gmail click: couldn't build inbox URL: {t}\n", .{err});
+            }
         },
         .close_popup => {
             if (popup_alive) terminateProcess(state.popup_pid.?);
@@ -227,6 +255,32 @@ test "isProcessAlive is true for our own process" {
 
 test "isProcessAlive is false for a pid that almost certainly doesn't exist" {
     try testing.expect(!isProcessAlive(999_999));
+}
+
+test "isPopupComm matches the truncated popup name, with or without the trailing newline" {
+    try testing.expect(isPopupComm("waybar-gmail-po\n"));
+    try testing.expect(isPopupComm("waybar-gmail-po"));
+}
+
+test "isPopupComm rejects other processes, including our own CLI and lookalikes" {
+    try testing.expect(!isPopupComm("waybar-gmail\n")); // the CLI itself
+    try testing.expect(!isPopupComm("waybar\n"));
+    try testing.expect(!isPopupComm("bash\n"));
+    try testing.expect(!isPopupComm(""));
+    try testing.expect(!isPopupComm("waybar-gmail-pop\n")); // can't occur (15-char cap) but must not match
+    try testing.expect(!isPopupComm("xwaybar-gmail-po\n"));
+}
+
+test "isPopupProcess is false for a live process that isn't the popup (the PID-reuse case)" {
+    // This test process is alive, and its pid is exactly the sort of number a
+    // stale click.state could still hold -- but it is not the popup.
+    const my_pid: i32 = @intCast(std.os.linux.getpid());
+    try testing.expect(isProcessAlive(my_pid));
+    try testing.expect(!isPopupProcess(testing.io, my_pid));
+}
+
+test "isPopupProcess is false for a pid that doesn't exist" {
+    try testing.expect(!isPopupProcess(testing.io, 999_999));
 }
 
 test "saveState then loadState round-trips" {

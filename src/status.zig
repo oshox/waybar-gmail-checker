@@ -43,12 +43,26 @@ const max_tooltip_cache_size = 32 * 1024;
 /// Overwrites the tooltip cache with `lines` (already-decoded plain text,
 /// one message per line -- Pango escaping happens at read time in
 /// `buildStatusJson`, not here, so the cache stays reusable by anything
-/// else that wants the plain text).
-pub fn saveTooltipCache(gpa: Allocator, io: Io, dir: Dir, lines: []const []const u8) !void {
+/// else that wants the plain text) and `unread`, the inbox's real unread
+/// total. The total is stored because the list itself is capped at
+/// `max_messages`, so the popup can't derive it -- and reading it from here
+/// means it can say "28 unread" the instant it opens, with no network call.
+pub fn saveTooltipCache(gpa: Allocator, io: Io, dir: Dir, lines: []const []const u8, unread: u32) !void {
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try std.json.Stringify.value(.{ .lines = lines }, .{}, &out.writer);
+    try std.json.Stringify.value(.{ .lines = lines, .unread = unread }, .{}, &out.writer);
     try cache.atomicWrite(dir, io, tooltip_cache_file, out.written(), cache.private_file_permissions);
+}
+
+/// The unread total stored by `saveTooltipCache`, or null when there's no
+/// cache, it's unreadable, or it predates this field (all normal states).
+pub fn loadUnreadCount(gpa: Allocator, io: Io, dir: Dir) ?u32 {
+    var buf: [max_tooltip_cache_size + 1]u8 = undefined;
+    const data = cache.readBounded(dir, io, tooltip_cache_file, &buf) catch return null;
+    const Shape = struct { unread: ?u32 = null };
+    const parsed = std.json.parseFromSlice(Shape, gpa, data, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.unread;
 }
 
 fn freeTooltipLines(gpa: Allocator, lines: [][]u8) void {
@@ -91,14 +105,33 @@ fn loadTooltipLines(gpa: Allocator, io: Io, dir: Dir) ?[][]u8 {
 /// regression: unescaped "<address>" text is invalid markup, which GTK
 /// fails to parse and renders as an empty tooltip rather than falling
 /// back to showing it as plain text).
+///
+/// Also drops characters that aren't legal in XML-ish markup at all: ASCII
+/// control characters other than tab and newline, DEL, and the U+FFFE /
+/// U+FFFF non-characters. They can arrive in a Subject via a crafted
+/// RFC 2047 word (`=?UTF-8?Q?=01?=`), and since a markup parse failure
+/// blanks the entire tooltip, one hostile sender shouldn't be able to do
+/// that. (Whether Pango really rejects them wasn't verifiable here; they
+/// carry no meaning in a one-line preview either way.)
 pub fn escapePango(gpa: Allocator, text: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    for (text) |c| {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
         switch (c) {
             '&' => try out.appendSlice(gpa, "&amp;"),
             '<' => try out.appendSlice(gpa, "&lt;"),
             '>' => try out.appendSlice(gpa, "&gt;"),
+            '\t', '\n' => try out.append(gpa, c),
+            0x00...0x08, 0x0B...0x1F, 0x7F => {},
+            // U+FFFE / U+FFFF are EF BF BE / EF BF BF in UTF-8.
+            0xEF => if (i + 2 < text.len and text[i + 1] == 0xBF and (text[i + 2] == 0xBE or text[i + 2] == 0xBF)) {
+                try out.appendSlice(gpa, "\u{FFFD}");
+                i += 2;
+            } else {
+                try out.append(gpa, c);
+            },
             else => try out.append(gpa, c),
         }
     }
@@ -146,11 +179,67 @@ fn genericTooltip(buf: []u8, class: StatusClass, count: u32) []const u8 {
     };
 }
 
+// ---- Watchdog: a poll that hangs must not freeze the module ----
+//
+// std.http.Client has no read or fetch timeout, so a connection that stalls
+// (a captive portal, a dead route, a half-open socket) would block `status`
+// forever -- and waybar waits for the previous run before starting the next,
+// so the module would sit on stale output indefinitely. A detached thread
+// sleeps for `poll_timeout_s` and, if the poll still hasn't produced output,
+// writes an error line and exits the process.
+
+/// A normal poll is one or two requests; even a first run fetching a full
+/// page of previews finishes in a few seconds. This is a backstop, not a
+/// budget.
+const poll_timeout_s: i64 = 30;
+
+const timeout_json =
+    \\{"text":"","alt":"error","tooltip":"Gmail request timed out","class":"error"}
+++ "\n";
+
+/// Decides who gets to write the status line: the poll itself, or the
+/// watchdog. Exactly one ever does, so output can't be duplicated or
+/// interleaved when the two race at the timeout. The main thread may ask
+/// repeatedly (it can legitimately write more than once, e.g. a fallback
+/// after a failed render); once the watchdog has won, the main thread stays
+/// silent and the process is already on its way out.
+const OutputGate = struct {
+    state: std.atomic.Value(u8) = .init(unclaimed),
+
+    const unclaimed = 0;
+    const main_owns = 1;
+    const watchdog_owns = 2;
+
+    fn claimForMain(self: *OutputGate) bool {
+        const prev = self.state.cmpxchgStrong(unclaimed, main_owns, .acq_rel, .acquire);
+        return prev == null or prev.? == main_owns;
+    }
+
+    fn claimForWatchdog(self: *OutputGate) bool {
+        return self.state.cmpxchgStrong(unclaimed, watchdog_owns, .acq_rel, .acquire) == null;
+    }
+};
+
+var output_gate: OutputGate = .{};
+
+fn watchdog(io: Io) void {
+    io.sleep(Io.Duration.fromSeconds(poll_timeout_s), .awake) catch return;
+    // The poll got there first and is writing (or has written) its result:
+    // leave it alone, the process exits normally when `run` returns.
+    if (!output_gate.claimForWatchdog()) return;
+    Io.File.stdout().writeStreamingAll(io, timeout_json) catch {};
+    std.debug.print("waybar-gmail status: no response within {d}s, giving up\n", .{poll_timeout_s});
+    std.process.exit(0);
+}
+
 // ---- Orchestration (not unit-tested; see real fixture-mode CLI runs) ----
 
 pub fn run(init: std.process.Init) u8 {
     const gpa = init.gpa;
     const io = init.io;
+
+    // If this can't be started the poll just runs without a backstop.
+    if (std.Thread.spawn(.{}, watchdog, .{io})) |t| t.detach() else |_| {}
 
     // .writerStreaming, not .writer: the latter assumes a seekable regular
     // file and issues a positional pwritev first, which (confirmed via
@@ -197,6 +286,9 @@ pub fn run(init: std.process.Init) u8 {
     const count = gmail.getUnreadCount(gpa, &gmail_client, access_token) catch |err| {
         switch (err) {
             error.Unauthorized => emitFallback(w, .unauthenticated, "Not signed in -- run: waybar-gmail auth"),
+            // Transient: say so rather than "Not signed in", which would
+            // send the user off to re-authenticate for nothing.
+            error.RateLimited => emitFallback(w, .@"error", "Gmail is rate limiting requests -- will retry next poll"),
             else => {
                 emitFallback(w, .@"error", "Couldn't reach Gmail");
                 std.debug.print("waybar-gmail status: getUnreadCount failed: {t}\n", .{err});
@@ -223,7 +315,7 @@ pub fn run(init: std.process.Init) u8 {
         // on a phone) must not linger and be shown once count is
         // nonzero again, or painted by the popup's cache-first open.
         messages_cache.save(gpa, io, dirs.state_dir, &.{}) catch {};
-        saveTooltipCache(gpa, io, dirs.state_dir, &.{}) catch {};
+        saveTooltipCache(gpa, io, dirs.state_dir, &.{}, 0) catch {};
     } else refresh: {
         // While anything is unread, refresh the list and previews on every
         // poll. This used to happen only when the unread count differed
@@ -232,11 +324,19 @@ pub fn run(init: std.process.Init) u8 {
         // could never match the count (so it refetched every poll anyway),
         // and one message read plus one new one left the count unchanged
         // and the previews stale. Refreshing unconditionally keeps the
-        // cache the popup opens from at most one poll interval old. The
-        // cost is one list call plus up to `max_messages` preview calls per
-        // poll, over a single connection.
+        // cache the popup opens from at most one poll interval old.
+        //
+        // What makes that cheap: the *list* is fetched every time, but a
+        // message's preview never changes, so previews already in the
+        // cache are reused and only ids not seen before cost a request. A
+        // poll with nothing new is the count call plus one list call.
         const cfg = config.load(gpa, io, dirs.config_dir);
-        const entries = messages_cache.fetchFromApi(gpa, &gmail_client, access_token, cfg.max_messages) catch |err| {
+        var known = messages_cache.load(gpa, io, dirs.state_dir) orelse std.ArrayList(messages_cache.Entry).empty;
+        defer {
+            for (known.items) |*e| e.deinit(gpa);
+            known.deinit(gpa);
+        }
+        const entries = messages_cache.fetchFromApi(gpa, &gmail_client, access_token, cfg.max_messages, known.items) catch |err| {
             std.debug.print("waybar-gmail status: refresh failed: {t}\n", .{err});
             break :refresh;
         };
@@ -257,7 +357,7 @@ pub fn run(init: std.process.Init) u8 {
             std.debug.print("waybar-gmail status: couldn't build tooltip lines: {t}\n", .{err});
             break :refresh;
         };
-        saveTooltipCache(gpa, io, dirs.state_dir, lines) catch |err| {
+        saveTooltipCache(gpa, io, dirs.state_dir, lines, count) catch |err| {
             std.debug.print("waybar-gmail status: couldn't save tooltip cache: {t}\n", .{err});
         };
         owned_lines = lines;
@@ -273,6 +373,9 @@ pub fn run(init: std.process.Init) u8 {
     else
         &.{genericTooltip(&fallback_buf, class, count)};
 
+    // Past this point the result is ready; if the watchdog already fired
+    // (the poll was too slow) it has written its own line and is exiting.
+    if (!output_gate.claimForMain()) return 0;
     buildStatusJson(gpa, w, text, class, tooltip_lines) catch |err| {
         std.debug.print("waybar-gmail status: failed to build status JSON: {t}\n", .{err});
         emitFallback(w, .@"error", "Internal error building status");
@@ -286,6 +389,7 @@ pub fn run(init: std.process.Init) u8 {
 /// in `run`: waybar must never see malformed JSON or a blank stdout, no
 /// matter what went wrong.
 fn emitFallback(w: *Io.Writer, class: StatusClass, message: []const u8) void {
+    if (!output_gate.claimForMain()) return; // the watchdog already answered
     const class_str = @tagName(class);
     std.json.Stringify.value(.{
         .text = "",
@@ -368,11 +472,57 @@ test "escapePango escapes all three special characters" {
     try testing.expectEqualStrings("&lt;a &amp; b&gt;", got);
 }
 
+test "OutputGate: exactly one side ever wins" {
+    var gate: OutputGate = .{};
+    // The watchdog wins the race...
+    try testing.expect(gate.claimForWatchdog());
+    // ...so the poll must stay silent, however often it asks.
+    try testing.expect(!gate.claimForMain());
+    try testing.expect(!gate.claimForMain());
+    try testing.expect(!gate.claimForWatchdog());
+}
+
+test "OutputGate: once the poll owns the output it may write repeatedly, and the watchdog never can" {
+    var gate: OutputGate = .{};
+    try testing.expect(gate.claimForMain());
+    // e.g. a failed render followed by a fallback line.
+    try testing.expect(gate.claimForMain());
+    try testing.expect(!gate.claimForWatchdog());
+}
+
+test "timeout_json is one valid JSON line with the error class" {
+    try testing.expect(std.mem.endsWith(u8, timeout_json, "\n"));
+    try testing.expectEqual(@as(?usize, timeout_json.len - 1), std.mem.indexOfScalar(u8, timeout_json, '\n'));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, timeout_json, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("error", parsed.value.object.get("class").?.string);
+    try testing.expectEqualStrings("", parsed.value.object.get("text").?.string);
+}
+
+test "escapePango drops control characters but keeps tab, newline and ordinary text" {
+    const got = try escapePango(testing.allocator, "a\x01b\x1bc\x7fd\te\nf\r");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("abcd\te\nf", got);
+}
+
+test "escapePango replaces the U+FFFE/U+FFFF non-characters and leaves other 0xEF sequences alone" {
+    const got = try escapePango(testing.allocator, "a\u{FFFE}b\u{FFFF}c\u{FFFD}d€e");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}c\u{FFFD}d€e", got);
+    try testing.expect(std.unicode.utf8ValidateSlice(got));
+}
+
+test "escapePango handles a truncated trailing 0xEF without reading out of bounds" {
+    const got = try escapePango(testing.allocator, "ok\xEF\xBF");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("ok\xEF\xBF", got);
+}
+
 test "saveTooltipCache then loadTooltipLines round-trips" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try saveTooltipCache(testing.allocator, testing.io, tmp.dir, &.{ "line one", "line two" });
+    try saveTooltipCache(testing.allocator, testing.io, tmp.dir, &.{ "line one", "line two" }, 7);
 
     const lines = loadTooltipLines(testing.allocator, testing.io, tmp.dir).?;
     defer freeTooltipLines(testing.allocator, lines);
@@ -380,6 +530,26 @@ test "saveTooltipCache then loadTooltipLines round-trips" {
     try testing.expectEqual(@as(usize, 2), lines.len);
     try testing.expectEqualStrings("line one", lines[0]);
     try testing.expectEqualStrings("line two", lines[1]);
+
+    // The unread total travels with the lines.
+    try testing.expectEqual(@as(?u32, 7), loadUnreadCount(testing.allocator, testing.io, tmp.dir));
+}
+
+test "loadUnreadCount is null when there's no cache, no field, or garbage" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectEqual(@as(?u32, null), loadUnreadCount(testing.allocator, testing.io, tmp.dir));
+
+    // A cache written before the field existed.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = tooltip_cache_file, .data = "{\"lines\":[\"old\"]}" });
+    try testing.expectEqual(@as(?u32, null), loadUnreadCount(testing.allocator, testing.io, tmp.dir));
+    // ...and it still loads its lines fine.
+    const lines = loadTooltipLines(testing.allocator, testing.io, tmp.dir).?;
+    defer freeTooltipLines(testing.allocator, lines);
+    try testing.expectEqualStrings("old", lines[0]);
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = tooltip_cache_file, .data = "not json" });
+    try testing.expectEqual(@as(?u32, null), loadUnreadCount(testing.allocator, testing.io, tmp.dir));
 }
 
 test "loadTooltipLines returns null when no cache exists yet" {

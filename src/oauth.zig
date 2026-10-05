@@ -274,6 +274,16 @@ pub fn parseTokenResponse(gpa: Allocator, body: []const u8) !TokenResponse {
     };
 }
 
+/// True when the token endpoint is saying the grant itself is dead -- the
+/// refresh token was revoked, or (for an app still in "Testing" status)
+/// expired, which Google does after 7 days -- as opposed to a transient
+/// failure. That's the one failure the user can only fix by running `auth`
+/// again, so it must surface as "unauthenticated", not a generic error.
+pub fn isInvalidGrant(status: u16, body: []const u8) bool {
+    if (status != 400 and status != 401) return false;
+    return std.mem.indexOf(u8, body, "invalid_grant") != null;
+}
+
 fn postForm(gpa: Allocator, http_client: *std.http.Client, url: []const u8, body: []const u8) ![]u8 {
     var response_body: Io.Writer.Allocating = .init(gpa);
     errdefer response_body.deinit();
@@ -285,7 +295,9 @@ fn postForm(gpa: Allocator, http_client: *std.http.Client, url: []const u8, body
         .response_writer = &response_body.writer,
     });
     if (result.status != .ok) {
-        std.debug.print("waybar-gmail: oauth token endpoint returned {d}\n", .{@intFromEnum(result.status)});
+        const code = @intFromEnum(result.status);
+        std.debug.print("waybar-gmail: oauth token endpoint returned {d}\n", .{code});
+        if (isInvalidGrant(code, response_body.written())) return error.InvalidGrant;
         return error.TokenExchangeFailed;
     }
     return response_body.toOwnedSlice();
@@ -352,7 +364,12 @@ pub fn getValidAccessToken(
         return error.NotAuthenticated;
     defer secureFree(gpa, refresh_token);
 
-    var tokens = try refreshAccessToken(gpa, http_client, creds, refresh_token);
+    // A refresh token Google no longer honors is the same situation to the
+    // user as never having authenticated: only `waybar-gmail auth` fixes it.
+    var tokens = refreshAccessToken(gpa, http_client, creds, refresh_token) catch |err| switch (err) {
+        error.InvalidGrant => return error.NotAuthenticated,
+        else => return err,
+    };
     defer tokens.deinit(gpa);
 
     try saveCachedToken(gpa, io, state_dir, tokens.access_token, now + tokens.expires_in);
@@ -395,40 +412,82 @@ pub fn runConsentFlow(gpa: Allocator, io: Io, http_client: *std.http.Client, cre
         std.debug.print("waybar-gmail: couldn't launch a browser automatically ({t}); open the URL above manually\n", .{err});
     };
 
-    var stream = try server.accept(io);
-    defer stream.close(io);
+    // A browser doesn't reliably make exactly one request to the redirect
+    // URI: Chrome-family browsers open speculative "preconnect" sockets that
+    // never send anything, and a page load can ask for /favicon.ico first.
+    // Treating whichever connection came first as THE callback made `auth`
+    // fail spuriously. So keep accepting until a request that actually
+    // carries the OAuth result (code= or error=) arrives, answering and
+    // ignoring the rest -- but only so many, so a misbehaving client can't
+    // keep this alive forever.
+    var connections: u8 = 0;
+    while (connections < max_callback_connections) : (connections += 1) {
+        var stream = try server.accept(io);
+        defer stream.close(io);
 
-    var read_buf: [4096]u8 = undefined;
-    var stream_reader = stream.reader(io, &read_buf);
-    const request_line = stream_reader.interface.takeDelimiterExclusive('\n') catch {
-        try respondHtml(io, &stream, "Malformed request. You can close this tab.");
-        return error.MalformedCallback;
-    };
-    const target = extractRequestTarget(std.mem.trimEnd(u8, request_line, "\r")) orelse {
-        try respondHtml(io, &stream, "Malformed request. You can close this tab.");
-        return error.MalformedCallback;
-    };
+        var read_buf: [4096]u8 = undefined;
+        var stream_reader = stream.reader(io, &read_buf);
+        // Nothing (or no complete line) sent: a preconnect. Move on.
+        const request_line = stream_reader.interface.takeDelimiterExclusive('\n') catch continue;
+        const target = extractRequestTarget(std.mem.trimEnd(u8, request_line, "\r")) orelse {
+            respond(io, &stream, "400 Bad Request", "Malformed request.");
+            continue;
+        };
+        if (!isCallbackTarget(target)) {
+            respond(io, &stream, "404 Not Found", "Not found.");
+            continue;
+        }
+        return handleCallback(gpa, io, http_client, creds, state_dir, &stream, target, state, verifier, redirect_uri);
+    }
+    return error.MalformedCallback;
+}
 
+/// How many connections the loopback listener will look at before giving up
+/// on ever seeing the OAuth callback.
+const max_callback_connections: u8 = 8;
+
+/// True for a request target that carries the OAuth result -- Google
+/// redirects with `?code=...` on success or `?error=...` if the user
+/// declined -- and false for the incidental requests a browser also makes
+/// (`/favicon.ico`, a bare `/`).
+pub fn isCallbackTarget(target: []const u8) bool {
+    return findRawQueryParam(target, "code") != null or findRawQueryParam(target, "error") != null;
+}
+
+/// Everything after the callback request has arrived: check the CSRF state,
+/// exchange the code, store the refresh token, cache the access token.
+fn handleCallback(
+    gpa: Allocator,
+    io: Io,
+    http_client: *std.http.Client,
+    creds: ClientCredentials,
+    state_dir: Dir,
+    stream: *Io.net.Stream,
+    target: []const u8,
+    state: []const u8,
+    verifier: []const u8,
+    redirect_uri: []const u8,
+) !void {
     const got_state = try extractQueryParam(gpa, target, "state");
     defer if (got_state) |s| gpa.free(s);
     if (got_state == null or !std.mem.eql(u8, got_state.?, state)) {
-        try respondHtml(io, &stream, "State mismatch -- possible CSRF. You can close this tab.");
+        try respondHtml(io, stream, "State mismatch -- possible CSRF. You can close this tab.");
         return error.StateMismatch;
     }
 
     const code = (try extractQueryParam(gpa, target, "code")) orelse {
-        try respondHtml(io, &stream, "No authorization code received. You can close this tab.");
+        try respondHtml(io, stream, "No authorization code received. You can close this tab.");
         return error.MissingCode;
     };
     defer gpa.free(code);
 
     var tokens = exchangeCodeForTokens(gpa, http_client, creds, code, redirect_uri, verifier) catch |err| {
-        try respondHtml(io, &stream, "Token exchange failed. You can close this tab.");
+        try respondHtml(io, stream, "Token exchange failed. You can close this tab.");
         return err;
     };
     defer tokens.deinit(gpa);
 
-    try respondHtml(io, &stream, "waybar-gmail is connected. You can close this tab.");
+    try respondHtml(io, stream, "waybar-gmail is connected. You can close this tab.");
 
     const refresh_token = tokens.refresh_token orelse return error.NoRefreshToken;
     try secrets.store(io, secret_service, secret_account, "waybar-gmail Gmail refresh token", refresh_token);
@@ -437,15 +496,22 @@ pub fn runConsentFlow(gpa: Allocator, io: Io, http_client: *std.http.Client, cre
     try saveCachedToken(gpa, io, state_dir, tokens.access_token, now + tokens.expires_in);
 }
 
-fn respondHtml(io: Io, stream: *Io.net.Stream, message: []const u8) !void {
+/// Writes a tiny HTML response and closes out the exchange. Errors writing
+/// to the browser are deliberately ignored: nothing here is worth failing
+/// the whole flow over.
+fn respond(io: Io, stream: *Io.net.Stream, status_line: []const u8, message: []const u8) void {
     var write_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &write_buf);
     writer.interface.print(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n" ++
+        "HTTP/1.1 {s}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n" ++
             "<!doctype html><html><body><p>{s}</p></body></html>",
-        .{message},
+        .{ status_line, message },
     ) catch return;
     writer.interface.flush() catch {};
+}
+
+fn respondHtml(io: Io, stream: *Io.net.Stream, message: []const u8) !void {
+    respond(io, stream, "200 OK", message);
 }
 
 /// Shared with click.zig (double-click -> open inbox) and, eventually,
@@ -457,16 +523,26 @@ fn respondHtml(io: Io, stream: *Io.net.Stream, message: []const u8) !void {
 /// depending on mime-association/D-Bus lookups), which is fine for it but
 /// not for us. `click`'s whole point is to feel instant, and even
 /// `runConsentFlow`'s one-time interactive use shouldn't hang on this when
-/// it already prints the URL as a fallback regardless. Once spawned, the
-/// child is reparented to init and reaped normally; we don't need its exit
-/// status.
+/// it already prints the URL as a fallback regardless. We don't need its
+/// exit status.
+///
+/// Launched through a throwaway `sh` that backgrounds it and exits at once,
+/// and *that* is what's waited on. Spawning `xdg-open` directly and never
+/// waiting is fine for the short-lived `click`/`auth` processes (init reaps
+/// it when they exit), but the popup is long-lived and opens a link per
+/// click: each unreaped xdg-open would sit as a zombie until the popup
+/// closed. Backgrounded under the shell, it's reparented to init the moment
+/// the shell exits, so nothing is left for this process to reap. The URL is
+/// passed as a positional argument ($1), never spliced into the script, so
+/// it can't be interpreted by the shell.
 pub fn openInBrowser(io: Io, url: []const u8) !void {
-    _ = try std.process.spawn(io, .{
-        .argv = &.{ "xdg-open", url },
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "xdg-open \"$1\" >/dev/null 2>&1 &", "sh", url },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
     });
+    _ = child.wait(io) catch {};
 }
 
 // ---- tests ----
@@ -585,6 +661,37 @@ test "extractQueryParam returns null when the key is absent" {
 test "extractQueryParam returns null for a target with no query string" {
     const got = try extractQueryParam(testing.allocator, "/favicon.ico", "code");
     try testing.expect(got == null);
+}
+
+test "isInvalidGrant recognizes a dead refresh token and nothing else" {
+    const body =
+        \\{"error": "invalid_grant", "error_description": "Token has been expired or revoked."}
+    ;
+    try testing.expect(isInvalidGrant(400, body));
+    try testing.expect(isInvalidGrant(401, body));
+    // Same words, wrong status: not the token endpoint rejecting the grant.
+    try testing.expect(!isInvalidGrant(200, body));
+    try testing.expect(!isInvalidGrant(500, body));
+    // Other token-endpoint failures are not "sign in again".
+    try testing.expect(!isInvalidGrant(400,
+        \\{"error": "invalid_client"}
+    ));
+    try testing.expect(!isInvalidGrant(503, "backend error"));
+    try testing.expect(!isInvalidGrant(400, ""));
+}
+
+test "isCallbackTarget accepts the OAuth result and rejects incidental requests" {
+    try testing.expect(isCallbackTarget("/?code=4%2F0AX&state=xyz"));
+    try testing.expect(isCallbackTarget("/?state=xyz&code=abc"));
+    // The user clicked "Cancel" on the consent screen.
+    try testing.expect(isCallbackTarget("/?error=access_denied&state=xyz"));
+    // What a browser asks for on the side.
+    try testing.expect(!isCallbackTarget("/favicon.ico"));
+    try testing.expect(!isCallbackTarget("/"));
+    try testing.expect(!isCallbackTarget("/?state=only-state"));
+    try testing.expect(!isCallbackTarget(""));
+    // A parameter whose *name* merely contains "code" is not "code".
+    try testing.expect(!isCallbackTarget("/?encoded=1&barcode=2"));
 }
 
 test "saveCachedToken then loadCachedToken round-trips" {

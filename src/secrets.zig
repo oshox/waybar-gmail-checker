@@ -20,12 +20,21 @@ pub fn store(io: Io, service: []const u8, account: []const u8, label: []const u8
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    const stdin = child.stdin.?;
-    stdin.writeStreamingAll(io, secret) catch return error.SecretToolFailed;
-    stdin.close(io);
-    child.stdin = null;
+    // From here on the child exists, so stdin must be closed and the child
+    // reaped on every path -- a failed write used to return straight out,
+    // leaking the pipe and leaving a zombie.
+    const wrote = blk: {
+        const stdin = child.stdin.?;
+        defer {
+            stdin.close(io);
+            child.stdin = null;
+        }
+        stdin.writeStreamingAll(io, secret) catch break :blk false;
+        break :blk true;
+    };
 
     const term = try child.wait(io);
+    if (!wrote) return error.SecretToolFailed;
     switch (term) {
         .exited => |code| if (code != 0) return error.SecretToolFailed,
         else => return error.SecretToolFailed,
@@ -46,16 +55,25 @@ pub fn lookup(gpa: Allocator, io: Io, service: []const u8, account: []const u8) 
     const stdout = child.stdout.?;
 
     // Refresh tokens are at most a few hundred bytes; this is generous
-    // headroom, not a real limit we expect to hit.
+    // headroom, not a real limit we expect to hit. It holds the secret, so
+    // it's wiped on the way out (the caller gets its own heap copy).
     var buf: [4096]u8 = undefined;
-    var reader = stdout.reader(io, &.{});
-    const n = reader.interface.readSliceShort(&buf) catch |err| switch (err) {
-        error.ReadFailed => return error.SecretToolFailed,
+    defer std.crypto.secureZero(u8, &buf);
+
+    // The pipe is closed and the child reaped whether or not the read
+    // worked; a failed read used to return before either, leaking the fd
+    // and leaving a zombie.
+    const read_len: ?usize = blk: {
+        defer {
+            stdout.close(io);
+            child.stdout = null;
+        }
+        var reader = stdout.reader(io, &.{});
+        break :blk reader.interface.readSliceShort(&buf) catch null;
     };
-    stdout.close(io);
-    child.stdout = null;
 
     const term = try child.wait(io);
+    const n = read_len orelse return error.SecretToolFailed;
     const found = switch (term) {
         .exited => |code| code == 0,
         else => false,

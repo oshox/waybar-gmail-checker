@@ -3,7 +3,7 @@
 A Waybar module that shows your Gmail unread count. Click the module for a
 popup listing unread messages with previews and per-message mark-read /
 archive / delete actions; click a message to open it in Gmail; double-click
-the module to open the inbox.
+or right-click the module to open the inbox.
 
 Written in Zig. See [`docs/zig-016-api-notes.md`](docs/zig-016-api-notes.md)
 for the design rationale (why two binaries, why a static musl build, why
@@ -50,6 +50,16 @@ your mail anywhere except directly to Google's own API.
    account under **Test users** -- while the app is in "Testing" status,
    only test users can authenticate, which is exactly what you want for a
    personal tool.
+
+   **Then click "Publish app" to move it to "In production".** This is
+   easy to miss and matters: per Google's documentation, the refresh token
+   of an app that stays in "Testing" expires after **7 days**, so the
+   module would drop to "Not signed in" every week until you re-ran
+   `waybar-gmail auth`. For a personal tool you don't need to go through
+   Google's verification review: the consent screen just shows a "Google
+   hasn't verified this app" warning once (Advanced → continue), and the
+   token is no longer on the 7-day clock. (If you'd rather leave the app in
+   Testing, plan on re-running `waybar-gmail auth` weekly.)
 4. **APIs & Services → Credentials → Create Credentials → OAuth client
    ID**. Application type: **Desktop app**. Name it anything.
 5. Download the resulting JSON (the "Download JSON" button on the
@@ -129,15 +139,26 @@ if it's absent or any field is missing):
 ```json
 {
   "max_messages": 15,
-  "double_click_ms": 350
+  "double_click_ms": 350,
+  "account_index": 0,
+  "idle_close_ms": 5000
 }
 ```
 
-- `max_messages` -- how many unread messages the popup fetches previews
-  for.
+- `max_messages` -- how many unread messages are listed and previewed (the
+  popup shows 5 at a time and slides the rest in as you clear them). Kept
+  between 1 and 50; `0` falls back to the default. The count shown in the
+  bar and the popup header is always your real unread total, whatever this
+  is set to.
 - `double_click_ms` -- the maximum gap between two clicks that counts as
   a double-click (opens the inbox instead of the popup). If double-clicks
   aren't being recognized reliably, raise this a little.
+- `account_index` -- which of your browser's signed-in Google accounts
+  opens messages and the inbox: the `N` in `mail.google.com/mail/u/N/`.
+  Leave it at `0` unless Gmail opens the wrong mailbox.
+- `idle_close_ms` -- the popup closes itself this long after opening if the
+  pointer never enters it, so one you opened and walked away from doesn't
+  stay on screen. `0` disables.
 
 There is deliberately no polling-interval setting here: that's controlled
 entirely by the `interval` field of the `custom/gmail` block in waybar's
@@ -152,10 +173,15 @@ to stderr, which waybar normally swallows -- run it in a terminal to see
 them.
 
 **`class: "unauthenticated"`.** Either `client_secret.json` is missing
-(see Setup step 2), or `waybar-gmail auth` hasn't been run yet (or its
-token expired and the stored refresh token is invalid, e.g., you revoked
-this app's access in your Google Account settings). Re-run `waybar-gmail
-auth`.
+(see Setup step 2), or `waybar-gmail auth` hasn't been run yet, or the
+stored refresh token is no longer valid -- you revoked this app's access
+in your Google Account settings, or (the usual cause) the OAuth app is
+still in "Testing" status, where Google expires it after 7 days (see the
+"Publish app" note in Setup step 2). Re-run `waybar-gmail auth`.
+
+**The tooltip says "Gmail is rate limiting requests".** Google throttled
+the API; it clears on its own and the next poll tries again. It is not an
+authentication problem.
 
 **Double-click opens the popup instead of the inbox (or vice versa).**
 Raise or lower `double_click_ms` in `~/.config/waybar-gmail/config.json`.

@@ -83,12 +83,42 @@ pub fn main(init: std.process.Init) u8 {
         .click => return click.run(init),
         .popup => return cmdPopup(init),
         .action => return cmdAction(init, &arg_it),
-        // Implemented in M6.
-        .open => {
-            std.debug.print("waybar-gmail: '{s}' is not implemented yet\n", .{sub_arg});
-            return 1;
-        },
+        .open => return cmdOpen(init, &arg_it),
     }
+}
+
+/// `waybar-gmail open [id]`: opens the inbox, or one message/thread when an
+/// id is given, in the browser. This is what the shipped waybar snippet
+/// binds to right-click. The account index comes from config.json (see
+/// config.account_index) so it opens the right one of several signed-in
+/// Google accounts.
+fn cmdOpen(init: std.process.Init, arg_it: *std.process.Args.Iterator) u8 {
+    const gpa = init.gpa;
+    const io = init.io;
+
+    const id = arg_it.next();
+
+    var dirs = config.openDirs(gpa, io, init.environ_map) catch |err| {
+        std.debug.print("waybar-gmail open: can't set up directories: {t}\n", .{err});
+        return 1;
+    };
+    defer dirs.deinit(gpa, io);
+    const cfg = config.load(gpa, io, dirs.config_dir);
+
+    var url_buf: [512]u8 = undefined;
+    const url = (if (id) |thread_id|
+        gmail.messageUrl(&url_buf, cfg.account_index, thread_id)
+    else
+        gmail.inboxUrl(&url_buf, cfg.account_index)) catch {
+        std.debug.print("waybar-gmail open: that id is too long to be a message id\n", .{});
+        return 1;
+    };
+
+    oauth.openInBrowser(io, url) catch |err| {
+        std.debug.print("waybar-gmail open: couldn't launch a browser: {t}\n", .{err});
+        return 1;
+    };
+    return 0;
 }
 
 /// `waybar-gmail popup` is a convenience alias for running the GTK binary
