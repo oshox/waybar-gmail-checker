@@ -104,6 +104,6 @@ mangle it than help. See the full snippet with comments at:
     $SCRIPT_DIR/waybar/config-snippet.jsonc
 
 Once that's saved, reload waybar:
-    pkill -SIGUSR2 waybar
+    pkill -x -SIGUSR2 waybar
 ============================================================
 EOF

@@ -17,6 +17,7 @@ const gmail = @import("gmail.zig");
 const oauth = @import("oauth.zig");
 const status = @import("status.zig");
 const click = @import("click.zig");
+const placement = @import("placement.zig");
 
 comptime {
     _ = mime;
@@ -28,6 +29,7 @@ comptime {
     _ = oauth;
     _ = status;
     _ = click;
+    _ = placement;
 }
 
 const Subcommand = enum {
@@ -159,8 +161,10 @@ fn cmdAction(init: std.process.Init, arg_it: *std.process.Args.Iterator) u8 {
     // the structured message/tooltip cache the popup owns (src/popup.zig)
     // -- a CLI-invoked action is expected to be reconciled by the next
     // popup open or status poll, not to keep those caches live itself.
+    // `-x`: match the process name exactly, so the signal doesn't also hit
+    // (and terminate) an open waybar-gmail-popup or this process itself.
     _ = std.process.spawn(io, .{
-        .argv = &.{ "pkill", "-RTMIN+9", "waybar" },
+        .argv = &.{ "pkill", "-RTMIN+9", "-x", "waybar" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,

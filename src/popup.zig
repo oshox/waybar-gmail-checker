@@ -21,6 +21,13 @@
 //!   then the API call runs; on failure the whole list is re-rendered
 //!   from the (unmodified) in-memory message list and the header shows
 //!   the error, so nothing is silently lost.
+//! - At most `max_visible_rows` rows are ever shown. The rest of the
+//!   fetched messages are a buffer: removing a row immediately slides the
+//!   next buffered message into the freed slot, so the popup keeps its
+//!   height (and the pointer stays over it) while there's more to do.
+//! - Placement: the popup opens next to the bar, lined up with the icon
+//!   that was clicked. Neither waybar nor the compositor will tell us where
+//!   that is, but the pointer is on it at click time -- see beginProbe.
 const std = @import("std");
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -31,15 +38,39 @@ const gmail = @import("gmail.zig");
 const http = @import("http.zig");
 const messages_cache = @import("messages_cache.zig");
 const oauth = @import("oauth.zig");
+const placement = @import("placement.zig");
 const status = @import("status.zig");
+
+/// The popup never shows more rows than this; further fetched messages wait
+/// in `AppState.messages` until an action frees a slot.
+const max_visible_rows = 5;
+
+const popup_width: c.gint = 360;
+
+/// Only used for the very first placement, before the real height is known
+/// (see resizeToFitContentCb, which re-places with the measured height).
+const initial_height_estimate: c.gint = 300;
+
+/// A leave-notify within this long of a resize we triggered ourselves is
+/// the compositor reacting to the surface changing size under a stationary
+/// pointer, not the user moving away -- see onWindowLeave.
+const resize_leave_grace_us: i64 = 400_000;
+
+/// How long the popup lingers after such a leave before closing. Longer
+/// than the normal 500ms hover-leave delay: the user has just clicked an
+/// action and is likely about to move to the next one.
+const post_resize_close_delay_ms: c.guint = 2000;
 
 /// Wraps the shared cache entry with the one thing that's specific to
 /// this GTK-linked binary: the row widget currently showing it (if any
 /// -- absent right after loading the cache, before the list box is
-/// built).
+/// built, and for buffered messages beyond `max_visible_rows`).
 const CachedMessage = struct {
     data: messages_cache.Entry,
     row: ?*c.GtkWidget = null,
+    /// An action on this message is in flight (its row is already gone but
+    /// the API call hasn't returned): it must not be given a new row.
+    pending: bool = false,
 
     fn deinit(self: *CachedMessage, gpa: Allocator) void {
         self.data.deinit(gpa);
@@ -58,6 +89,28 @@ const AppState = struct {
     window: *c.GtkWindow,
     list_box: *c.GtkWidget,
     header_label: *c.GtkWidget,
+    /// The invisible surface that reads the pointer position at startup
+    /// (see beginProbe), and the fallback timer that gives up on it. Both
+    /// are null once finishProbe has run.
+    probe: ?*c.GtkWidget = null,
+    probe_timer: ?c.guint = null,
+    /// Repeating timer that nudges the pointer until the probe sees it
+    /// (see nudgePointer), and how many times it has fired.
+    probe_nudge_timer: ?c.guint = null,
+    probe_nudges: u8 = 0,
+    /// Raw pointer position the probe reported, before the output size is
+    /// attached to it in finishProbe.
+    probe_xy: ?[2]f64 = null,
+    /// Where the pointer was at click time; null means placement failed and
+    /// the popup is just centred.
+    pointer: ?placement.Pointer = null,
+    /// Last height handed to the compositor, so a relayout that didn't
+    /// change anything doesn't trigger a pointless resize (and the stray
+    /// leave-notify that comes with it).
+    last_height: c.gint = 0,
+    /// Leave-notify events before this monotonic time (microseconds) are
+    /// the echo of our own resize -- see onWindowLeave.
+    ignore_leave_until_us: i64 = 0,
     messages: std.ArrayList(CachedMessage) = .empty,
     /// Guards against closePopup running twice: GTK signals that can
     /// legitimately fire close to simultaneously (a focus-out arriving
@@ -131,8 +184,14 @@ fn notifyWaybar(io: Io) void {
     // action -- several unreaped children in one popup session would
     // accumulate as zombies until the popup itself finally exits. Wait on
     // it; pkill returns essentially instantly either way.
+    //
+    // `-x` (exact name) is load-bearing: without it "waybar" is a regex
+    // matched against every process name, which includes this very
+    // process ("waybar-gmail-popup"). SIGRTMIN+9 has no handler here, so its
+    // default action -- terminate -- closed the popup after every single
+    // action.
     var child = std.process.spawn(io, .{
-        .argv = &.{ "pkill", "-RTMIN+9", "waybar" },
+        .argv = &.{ "pkill", "-RTMIN+9", "-x", "waybar" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -260,7 +319,14 @@ fn onActionClicked(_: *c.GtkWidget, user_data: c.gpointer) callconv(.c) void {
     // already uses successfully -- lets GTK process the destroy's
     // repaint on its own, through a path already proven to work.
     if (findMessageIndex(app, ctx.message_id)) |idx| {
-        if (app.messages.items[idx].row) |row| c.gtk_widget_destroy(row);
+        const msg = &app.messages.items[idx];
+        msg.pending = true;
+        if (msg.row) |row| destroyRow(row);
+        msg.row = null;
+        // Slide the next buffered message (if any) into the freed slot
+        // right away, so the list keeps its height and the buttons stay
+        // under the pointer for the next click.
+        fillVisibleRows(app);
     }
 
     const deferred = app.gpa.create(PendingActionContext) catch {
@@ -411,16 +477,46 @@ fn clearListBox(app: *AppState) void {
     }
 }
 
-/// Clears and rebuilds the list box from `app.messages`.
-fn populateListFromMessages(app: *AppState) void {
-    clearListBox(app);
+/// Destroys one message's row. `row` is the widget buildRow returned, but
+/// gtk_container_add on a GtkListBox wraps it in a GtkListBoxRow of its
+/// own -- destroying only the inner widget (as this used to) leaves that
+/// empty wrapper behind in the list, one more per action. Destroy the
+/// wrapper, which takes the inner widget with it.
+fn destroyRow(row: *c.GtkWidget) void {
+    c.gtk_widget_destroy(c.gtk_widget_get_parent(row) orelse row);
+}
+
+/// Gives a row to buffered messages, in order, until `max_visible_rows`
+/// are showing. Safe to call any time: it only ever appends, which is
+/// correct because rows are handed out front-to-back and only ever removed,
+/// so a message that newly qualifies always belongs after those already
+/// shown.
+fn fillVisibleRows(app: *AppState) void {
     const list_container: *c.GtkContainer = @ptrCast(app.list_box);
 
+    var shown: usize = 0;
+    for (app.messages.items) |m| {
+        if (m.row != null) shown += 1;
+    }
+
     for (app.messages.items) |*msg| {
+        if (shown >= max_visible_rows) break;
+        if (msg.pending or msg.row != null) continue;
         const row = buildRow(app, msg) catch continue;
         msg.row = row;
         c.gtk_container_add(list_container, row);
+        c.gtk_widget_show_all(row);
+        shown += 1;
     }
+}
+
+/// Clears and rebuilds the list box from `app.messages`.
+fn populateListFromMessages(app: *AppState) void {
+    clearListBox(app);
+    // clearListBox just destroyed every row widget; the `row` pointers
+    // still held by messages that were showing one now dangle.
+    for (app.messages.items) |*msg| msg.row = null;
+    fillVisibleRows(app);
     c.gtk_widget_show_all(app.list_box);
     updateHeaderCount(app);
 
@@ -441,11 +537,61 @@ fn populateListFromMessages(app: *AppState) void {
     _ = c.g_timeout_add(1, resizeToFitContentCb, app);
 }
 
+fn layerEdge(edge: placement.Edge) c.GtkLayerShellEdge {
+    return switch (edge) {
+        .left => c.GTK_LAYER_SHELL_EDGE_LEFT,
+        .right => c.GTK_LAYER_SHELL_EDGE_RIGHT,
+        .top => c.GTK_LAYER_SHELL_EDGE_TOP,
+        .bottom => c.GTK_LAYER_SHELL_EDGE_BOTTOM,
+    };
+}
+
+/// Anchors the popup beside the bar, lined up with where the pointer was
+/// at click time, given the height it's about to have. With no pointer
+/// position (the probe never got one) it sets no anchors at all, which
+/// layer-shell treats as "centred on the output".
+///
+/// Margins and anchors are re-applied on every height change because the
+/// clamp that keeps the popup on screen depends on the height.
+fn applyPlacement(app: *AppState, popup_height: c.gint) void {
+    const pointer = app.pointer orelse return;
+    const layout = placement.compute(pointer, popup_width, popup_height);
+
+    const all = [_]placement.Edge{ .left, .right, .top, .bottom };
+    for (all) |edge| {
+        const anchored = edge == layout.bar_edge or edge == layout.cross_edge;
+        c.gtk_layer_set_anchor(app.window, layerEdge(edge), @intFromBool(anchored));
+    }
+    c.gtk_layer_set_margin(app.window, layerEdge(layout.bar_edge), layout.bar_margin);
+    c.gtk_layer_set_margin(app.window, layerEdge(layout.cross_edge), layout.cross_margin);
+}
+
 fn resizeToFitContentCb(user_data: c.gpointer) callconv(.c) c.gboolean {
     const app: *AppState = @ptrCast(@alignCast(user_data.?));
+
+    // gtk_widget_set_size_request below makes the size request a *minimum*
+    // the window's preferred height can never go under, so measuring with
+    // the previous request still in place could only ever report "same or
+    // taller" -- the window would never shrink. Measure the content's own
+    // height, then put the request back if nothing changed.
+    c.gtk_widget_set_size_request(@ptrCast(app.window), popup_width, -1);
     var natural_height: c.gint = 0;
     c.gtk_widget_get_preferred_height(@ptrCast(app.window), null, &natural_height);
-    if (natural_height > 0) {
+
+    if (natural_height <= 0 or natural_height == app.last_height) {
+        const previous: c.gint = if (app.last_height > 0) app.last_height else -1;
+        c.gtk_widget_set_size_request(@ptrCast(app.window), popup_width, previous);
+        return 0;
+    }
+
+    {
+        app.last_height = natural_height;
+        // The compositor answers a size change under a stationary pointer
+        // with a leave-notify (the pointer may no longer be over us);
+        // flag that so onWindowLeave doesn't mistake it for the user
+        // moving away.
+        app.ignore_leave_until_us = c.g_get_monotonic_time() + resize_leave_grace_us;
+        applyPlacement(app, natural_height);
         // gtk-layer-shell's own header comment documents this exact
         // two-call pattern: set_size_request first (the real target
         // size), then gtk_window_resize with throwaway arguments purely
@@ -455,7 +601,7 @@ fn resizeToFitContentCb(user_data: c.gpointer) callconv(.c) c.gboolean {
         // size changed. Confirmed via WAYLAND_DEBUG=1: without the
         // gtk_window_resize call, no new set_size is ever sent at all,
         // no matter how the request is made or how long you wait.
-        c.gtk_widget_set_size_request(@ptrCast(app.window), 360, natural_height);
+        c.gtk_widget_set_size_request(@ptrCast(app.window), popup_width, natural_height);
         c.gtk_window_resize(app.window, 1, 1);
     }
     return 0; // G_SOURCE_REMOVE: one-shot
@@ -487,12 +633,15 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
         const msg = std.fmt.allocPrint(app.gpa, "Gmail — {s} failed, try again", .{@tagName(kind)}) catch "Gmail — action failed";
         defer if (!std.mem.eql(u8, msg, "Gmail — action failed")) app.gpa.free(msg);
         updateHeader(app, msg);
+        app.messages.items[idx].pending = false;
         populateListFromMessages(app); // the message is still in app.messages -- just re-render it
         return;
     };
 
     var removed = app.messages.orderedRemove(idx);
+    if (removed.row) |row| destroyRow(row);
     removed.deinit(app.gpa);
+    fillVisibleRows(app); // normally a no-op: onActionClicked already refilled
     persistCaches(app);
     notifyWaybar(app.io);
 
@@ -510,7 +659,9 @@ fn performAction(app: *AppState, message_id: []const u8, kind: ActionKind) void 
     // removal never re-triggers the gtk-layer-shell resize dance (see
     // resizeToFitContentCb's own comment for why one is needed at all).
     // Without this, the window stayed at its pre-action size, one
-    // row's worth too tall, after every single action.
+    // row's worth too tall, after every single action. (While more than
+    // `max_visible_rows` messages remain, the refill keeps the height
+    // identical and resizeToFitContentCb returns without touching anything.)
     _ = c.g_timeout_add(1, resizeToFitContentCb, app);
 }
 
@@ -604,15 +755,37 @@ fn onWindowEnter(_: *c.GtkWidget, _: *c.GdkEvent, user_data: c.gpointer) callcon
     return 0;
 }
 
-fn onWindowLeave(_: *c.GtkWidget, _: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
+fn onWindowLeave(_: *c.GtkWidget, event: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
     const app: *AppState = @ptrCast(@alignCast(user_data.?));
+
+    // Two kinds of leave-notify aren't the pointer leaving the popup.
+    //
+    // 1. The pointer moving from the window onto one of its own child
+    //    windows -- the scrolled viewport, a row's event box, a button's
+    //    input window. GDK reports that as a leave on the window with
+    //    detail INFERIOR, and GTK never sends the matching enter to the
+    //    toplevel (crossing events aren't propagated up), so onWindowEnter
+    //    can't cancel the timer this would start. That is what closed the
+    //    popup shortly after hovering a button.
+    const crossing: *const c.GdkEventCrossing = @ptrCast(@alignCast(event));
+    if (crossing.detail == c.GDK_NOTIFY_INFERIOR) return 0;
+
+    // 2. The compositor's reaction to the popup resizing under a pointer
+    //    that hasn't moved (an action removed a row and the popup shrank
+    //    out from under it). Don't close on the spot -- the user is most
+    //    likely about to click the next row's button -- but don't leave
+    //    the popup stranded open either if they really did move away: close
+    //    after a longer grace period. Re-entering cancels it (onWindowEnter).
+    const resize_echo = c.g_get_monotonic_time() < app.ignore_leave_until_us;
+    const delay_ms: c.guint = if (resize_echo) post_resize_close_delay_ms else 500;
+
     // Moving between two child widgets (e.g. adjacent action buttons)
     // can transiently cross the window's own boundary and back; only
     // start a new timer if one isn't already pending, so rapid
     // leave/enter pairs don't keep resetting a close that was already
     // in flight for no reason (harmless either way, but avoidable).
     if (app.hover_close_timer == null) {
-        app.hover_close_timer = c.g_timeout_add(500, hoverCloseTimeoutCb, app);
+        app.hover_close_timer = c.g_timeout_add(delay_ms, hoverCloseTimeoutCb, app);
     }
     return 0;
 }
@@ -678,6 +851,178 @@ fn setupAppState(init_data: std.process.Init, gtk_app: *c.GtkApplication) !*AppS
     return app;
 }
 
+// ---- placement probe ----
+//
+// The popup should open next to the icon that was clicked, wherever the bar
+// is. Waybar passes `on-click` no coordinates and Wayland clients can't ask
+// where another client drew something, but at click time the pointer is on
+// that icon. So before building the real popup, map a fully transparent,
+// output-sized overlay surface: the compositor sends it a pointer enter
+// with the pointer's position, and the nearest screen edge tells us which
+// side the bar is on (see placement.zig). The probe is gone again within a
+// few milliseconds.
+//
+// A compositor only sends a surface a pointer `enter` when the pointer
+// moves, and at click time it is stationary -- confirmed live on sway, whose
+// protocol trace shows the probe mapped at full size and no wl_pointer event
+// at all. So on sway the probe asks for a zero-distance pointer move, which
+// makes it re-evaluate pointer focus (see nudgePointer).
+//
+// Falls back to a centred popup if no pointer event arrives in time.
+
+const probe_timeout_ms: c.guint = 250;
+
+/// The nudge repeats because the first one can land before the probe is
+/// actually mapped (a surface that hasn't committed a buffer yet can't take
+/// pointer focus); it stops as soon as the probe has seen the pointer. The
+/// attempts all fit inside `probe_timeout_ms`.
+const probe_nudge_interval_ms: c.guint = 40;
+const probe_max_nudges = 4;
+
+/// Asks sway to move the pointer by nothing. Nothing visibly moves, but
+/// sway treats it as pointer motion and delivers `enter` (with exact
+/// coordinates) to whatever surface is under the pointer -- now the probe.
+///
+/// Best effort and sway-specific: with no `swaymsg` (another compositor) or
+/// no sway socket this silently does nothing, and the probe's timeout falls
+/// back to centring. Waits for the child, like notifyWaybar, so it can't
+/// leave a zombie behind in this long-lived process; swaymsg returns in
+/// milliseconds.
+fn nudgePointer(io: Io) void {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "swaymsg", "seat", "-", "cursor", "move", "0", "0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+    _ = child.wait(io) catch {};
+}
+
+fn probeNudgeCb(user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    if (app.probe == null or app.probe_xy != null) {
+        app.probe_nudge_timer = null;
+        return 0; // G_SOURCE_REMOVE
+    }
+    nudgePointer(app.io);
+    app.probe_nudges += 1;
+    if (app.probe_nudges >= probe_max_nudges) {
+        app.probe_nudge_timer = null;
+        return 0; // G_SOURCE_REMOVE
+    }
+    return 1; // G_SOURCE_CONTINUE
+}
+
+/// Paints the probe fully transparent. Returning true stops the default
+/// handler, which would otherwise paint the theme's window background over it.
+fn onProbeDraw(_: *c.GtkWidget, cr: *c.cairo_t, _: c.gpointer) callconv(.c) c.gboolean {
+    c.cairo_set_operator(cr, c.CAIRO_OPERATOR_CLEAR);
+    c.cairo_paint(cr);
+    return 1;
+}
+
+fn onProbePointer(_: *c.GtkWidget, event: *c.GdkEvent, user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    if (app.probe == null or app.probe_xy != null) return 0;
+
+    var x: f64 = 0;
+    var y: f64 = 0;
+    if (c.gdk_event_get_coords(event, &x, &y) == 0) return 0;
+    app.probe_xy = .{ x, y };
+
+    // finishProbe destroys the window this very handler is running on, so
+    // hand off to the main loop rather than doing it mid-emission.
+    _ = c.g_timeout_add(1, finishProbeCb, app);
+    return 0;
+}
+
+fn finishProbeCb(user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    finishProbe(app);
+    return 0; // G_SOURCE_REMOVE: one-shot
+}
+
+fn probeTimeoutCb(user_data: c.gpointer) callconv(.c) c.gboolean {
+    const app: *AppState = @ptrCast(@alignCast(user_data.?));
+    app.probe_timer = null; // this source is removed on return regardless
+    finishProbe(app);
+    return 0; // G_SOURCE_REMOVE: one-shot
+}
+
+/// Turns whatever the probe saw into `app.pointer`, builds the real popup,
+/// and only then destroys the probe -- the GtkApplication must never be
+/// left with zero windows, or it quits. Idempotent: the pointer handler and
+/// the fallback timer can both reach it.
+fn finishProbe(app: *AppState) void {
+    const probe = app.probe orelse return;
+    app.probe = null;
+    if (app.probe_timer) |id| {
+        _ = c.g_source_remove(id);
+        app.probe_timer = null;
+    }
+    // Must not outlive this function: a later closePopup frees `app`.
+    if (app.probe_nudge_timer) |id| {
+        _ = c.g_source_remove(id);
+        app.probe_nudge_timer = null;
+    }
+
+    if (app.probe_xy) |xy| {
+        const w = c.gtk_widget_get_allocated_width(probe);
+        const h = c.gtk_widget_get_allocated_height(probe);
+        // The pointer has to lie inside the surface it was reported on. If
+        // it doesn't, the allocation hadn't caught up with the compositor's
+        // configure yet and the output size is wrong -- better to centre
+        // than to place against a made-up size.
+        if (xy[0] >= 0 and xy[1] >= 0 and xy[0] < @as(f64, @floatFromInt(w)) and xy[1] < @as(f64, @floatFromInt(h))) {
+            app.pointer = .{ .x = xy[0], .y = xy[1], .out_w = w, .out_h = h };
+            std.debug.print("waybar-gmail-popup: placing at pointer ({d:.0}, {d:.0}) on {d}x{d} output\n", .{ xy[0], xy[1], w, h });
+        } else {
+            std.debug.print("waybar-gmail-popup: pointer ({d:.0}, {d:.0}) outside probe {d}x{d}, centring\n", .{ xy[0], xy[1], w, h });
+        }
+    } else {
+        std.debug.print("waybar-gmail-popup: probe saw no pointer within {d}ms, centring\n", .{probe_timeout_ms});
+    }
+
+    showPopup(app);
+    c.gtk_widget_destroy(probe);
+}
+
+fn beginProbe(app: *AppState) void {
+    const widget = c.gtk_application_window_new(app.gtk_app);
+    const window: *c.GtkWindow = @ptrCast(widget);
+    c.gtk_window_set_title(window, "Gmail (placement probe)");
+
+    // Transparent: an RGBA visual (if the screen has one) plus our own draw
+    // handler that never paints anything.
+    if (c.gdk_screen_get_rgba_visual(c.gtk_widget_get_screen(widget))) |visual| {
+        c.gtk_widget_set_visual(widget, visual);
+    }
+    c.gtk_widget_set_app_paintable(widget, 1);
+
+    c.gtk_layer_init_for_window(window);
+    c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
+    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_LEFT, 1);
+    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_RIGHT, 1);
+    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
+    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, 1);
+    // -1: cover the whole output, including the bar's own exclusive zone.
+    // Otherwise the surface would start beside the bar and the coordinates
+    // it reports would be offset from the output's origin.
+    c.gtk_layer_set_exclusive_zone(window, -1);
+    c.gtk_layer_set_keyboard_mode(window, c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+    c.gtk_layer_set_namespace(window, "waybar-gmail-probe");
+
+    c.gtk_widget_add_events(widget, c.GDK_ENTER_NOTIFY_MASK | c.GDK_POINTER_MOTION_MASK);
+    _ = c.g_signal_connect_data(window, "draw", @ptrCast(&onProbeDraw), null, null, 0);
+    _ = c.g_signal_connect_data(window, "enter-notify-event", @ptrCast(&onProbePointer), app, null, 0);
+    _ = c.g_signal_connect_data(window, "motion-notify-event", @ptrCast(&onProbePointer), app, null, 0);
+
+    app.probe = widget;
+    app.probe_timer = c.g_timeout_add(probe_timeout_ms, probeTimeoutCb, app);
+    app.probe_nudge_timer = c.g_timeout_add(probe_nudge_interval_ms, probeNudgeCb, app);
+    c.gtk_widget_show_all(widget);
+}
+
 fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) void {
     const init_data: *const std.process.Init = @ptrCast(@alignCast(user_data.?));
 
@@ -687,7 +1032,13 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
         return;
     };
 
-    const window_widget = c.gtk_application_window_new(gtk_app.?);
+    // The real popup is built by finishProbe, once we know where to put it.
+    beginProbe(app);
+}
+
+/// Builds and shows the actual popup window.
+fn showPopup(app: *AppState) void {
+    const window_widget = c.gtk_application_window_new(app.gtk_app);
     const window: *c.GtkWindow = @ptrCast(window_widget);
     app.window = window;
     c.gtk_window_set_title(window, "Gmail");
@@ -697,14 +1048,13 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
     // width but leaving height at -1 (natural) lets the window's actual
     // size come from its children -- header + however tall the list of
     // messages actually is.
-    c.gtk_widget_set_size_request(window_widget, 360, -1);
+    c.gtk_widget_set_size_request(window_widget, popup_width, -1);
 
     c.gtk_layer_init_for_window(window);
     c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_TOP);
-    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
-    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_RIGHT, 1);
-    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_TOP, 34);
-    c.gtk_layer_set_margin(window, c.GTK_LAYER_SHELL_EDGE_RIGHT, 8);
+    // Anchors and margins from where the pointer was; re-applied with the
+    // measured height by resizeToFitContentCb once there is one.
+    applyPlacement(app, initial_height_estimate);
     c.gtk_layer_set_keyboard_mode(window, c.GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
     c.gtk_layer_set_namespace(window, "waybar-gmail");
 
@@ -721,14 +1071,12 @@ fn onActivate(gtk_app: ?*c.GtkApplication, user_data: c.gpointer) callconv(.c) v
     c.gtk_box_pack_start(outer, header_widget, 0, 0, 0);
 
     const scrolled_widget = c.gtk_scrolled_window_new(null, null);
-    // Size to content, full stop -- no max_content_height cap. A cap
-    // here (340px, previously) meant the window only ever fit ~3 rows
-    // before a scrollbar appeared, and the whole point of this popup is
-    // to see everything at a glance without scrolling. GtkScrolledWindow
-    // is still used rather than a plain box so an unusually long list
-    // (more unread than fits on screen) degrades to scrolling instead of
-    // silently clipping content with no way to reach it -- an edge case
-    // this should never hit in normal use, not the common case.
+    // Size to content, no max_content_height cap: the list can never hold
+    // more than `max_visible_rows` rows (the rest of the fetched messages
+    // are buffered, not rendered -- see fillVisibleRows), so it never needs
+    // to scroll and its natural height is always the right height.
+    // GtkScrolledWindow is kept rather than a plain box only because the
+    // layout was tuned around it (see fetchMessages's doc comment).
     c.gtk_scrolled_window_set_propagate_natural_height(scrolled_widget, 1);
     const list_box_widget = c.gtk_list_box_new();
     app.list_box = list_box_widget;

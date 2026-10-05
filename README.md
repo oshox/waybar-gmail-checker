@@ -81,8 +81,12 @@ more likely to mangle it than help. Copy the printed snippet (also at
 config, then reload waybar:
 
 ```sh
-pkill -SIGUSR2 waybar
+pkill -x -SIGUSR2 waybar
 ```
+
+(`-x` matches the process name exactly. Without it `pkill` also matches
+`waybar-gmail` and `waybar-gmail-popup`, and the signal would terminate an
+open popup.)
 
 ### 4. Authenticate
 
@@ -93,7 +97,7 @@ waybar-gmail auth
 Opens your browser for Google's consent screen. Once you approve, the
 module should start showing your unread count within a few seconds
 (or immediately -- click the module, or send waybar the refresh signal:
-`pkill -RTMIN+9 waybar`).
+`pkill -x -RTMIN+9 waybar`).
 
 ## Configuration
 

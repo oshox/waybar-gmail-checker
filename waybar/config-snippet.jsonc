@@ -11,7 +11,7 @@
 // - signal: fired by every mark-read/archive/trash action and by a
 //   completed `auth` run, so the count updates immediately instead of
 //   waiting for the next interval. Must match the SIGRTMIN+N used in
-//   `pkill -RTMIN+9 waybar` calls elsewhere (install.sh keeps these in
+//   `pkill -RTMIN+9 -x waybar` calls elsewhere (install.sh keeps these in
 //   sync automatically; if you assign this signal number to a different
 //   module too, both will refresh together, which is harmless).
 "custom/gmail": {

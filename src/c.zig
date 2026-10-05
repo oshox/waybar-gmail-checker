@@ -12,8 +12,10 @@
 //! This is safe because the GTK3/GObject C ABI exposed here is just opaque
 //! pointers-to-structs (GObject's whole design point) and plain function
 //! pointers for signals -- there is no struct layout for Zig to get wrong,
-//! with the sole exception of GList (a plain 3-pointer struct, frozen ABI,
-//! declared exactly below). Every signature here was read directly from
+//! with two exceptions: GList (a plain 3-pointer struct, frozen ABI) and
+//! GdkEventCrossing (a frozen GTK3 event struct; GTK3 has no accessor for
+//! its `detail` field), both declared exactly below. Every signature here
+//! was read directly from
 //! the system headers under /usr/include/gtk-3.0 and /usr/include/glib-2.0,
 //! not guessed or recalled from memory.
 
@@ -34,6 +36,9 @@ pub const GtkButton = opaque {};
 pub const GtkScrolledWindow = opaque {};
 pub const GtkEventBox = opaque {};
 pub const GdkEvent = opaque {};
+pub const GdkScreen = opaque {};
+pub const GdkVisual = opaque {};
+pub const cairo_t = opaque {};
 
 // ---- scalar typedefs ----
 pub const gboolean = c_int;
@@ -52,21 +57,53 @@ pub const PANGO_ELLIPSIZE_END: PangoEllipsizeMode = 3;
 
 pub const GtkLayerShellLayer = c_int;
 pub const GTK_LAYER_SHELL_LAYER_TOP: GtkLayerShellLayer = 2;
+pub const GTK_LAYER_SHELL_LAYER_OVERLAY: GtkLayerShellLayer = 3;
 
 pub const GtkLayerShellEdge = c_int;
+pub const GTK_LAYER_SHELL_EDGE_LEFT: GtkLayerShellEdge = 0;
 pub const GTK_LAYER_SHELL_EDGE_RIGHT: GtkLayerShellEdge = 1;
 pub const GTK_LAYER_SHELL_EDGE_TOP: GtkLayerShellEdge = 2;
+pub const GTK_LAYER_SHELL_EDGE_BOTTOM: GtkLayerShellEdge = 3;
 
 pub const GtkLayerShellKeyboardMode = c_int;
+pub const GTK_LAYER_SHELL_KEYBOARD_MODE_NONE: GtkLayerShellKeyboardMode = 0;
 pub const GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND: GtkLayerShellKeyboardMode = 2;
+
+/// cairo_operator_t's first enumerator (cairo.h).
+pub const cairo_operator_t = c_int;
+pub const CAIRO_OPERATOR_CLEAR: cairo_operator_t = 0;
 
 /// Read directly from /usr/include/gtk-3.0/gdk/gdkkeysyms.h -- a frozen
 /// X11 keysym value, not something GTK versions change.
 pub const GDK_KEY_Escape: guint = 0xff1b;
 
 /// Read directly from /usr/include/gtk-3.0/gdk/gdktypes.h's GdkEventMask.
+pub const GDK_POINTER_MOTION_MASK: gint = 1 << 2;
 pub const GDK_ENTER_NOTIFY_MASK: gint = 1 << 12;
 pub const GDK_LEAVE_NOTIFY_MASK: gint = 1 << 13;
+
+/// GdkNotifyType (gdkevents.h): a leave/enter whose pointer merely moved
+/// between a window and one of its own child windows.
+pub const GDK_NOTIFY_INFERIOR: c_int = 2;
+
+/// Layout copied from `struct _GdkEventCrossing` in
+/// /usr/include/gtk-3.0/gdk/gdkevents.h. GdkEventType, GdkCrossingMode and
+/// GdkNotifyType are all plain C enums, i.e. c_int here.
+pub const GdkEventCrossing = extern struct {
+    type: c_int,
+    window: ?*anyopaque,
+    send_event: i8,
+    subwindow: ?*anyopaque,
+    time: u32,
+    x: f64,
+    y: f64,
+    x_root: f64,
+    y_root: f64,
+    mode: c_int,
+    detail: c_int,
+    focus: gboolean,
+    state: c_uint,
+};
 
 pub const GConnectFlags = c_uint;
 pub const GSourceFunc = *const fn (gpointer) callconv(.c) gboolean;
@@ -96,6 +133,7 @@ pub extern fn g_application_run(application: *GApplication, argc: c_int, argv: ?
 pub extern fn g_application_quit(application: *GApplication) void;
 pub extern fn g_timeout_add(interval: guint, function: GSourceFunc, data: gpointer) guint;
 pub extern fn g_source_remove(tag: guint) gboolean;
+pub extern fn g_get_monotonic_time() i64;
 pub extern fn g_list_free(list: ?*GList) void;
 
 // ---- GtkApplication ----
@@ -111,6 +149,13 @@ pub extern fn gtk_widget_show_all(widget: *GtkWidget) void;
 pub extern fn gtk_widget_destroy(widget: *GtkWidget) void;
 pub extern fn gtk_widget_set_size_request(widget: *GtkWidget, width: gint, height: gint) void;
 pub extern fn gtk_widget_add_events(widget: *GtkWidget, events: gint) void;
+pub extern fn gtk_widget_get_parent(widget: *GtkWidget) ?*GtkWidget;
+pub extern fn gtk_widget_get_screen(widget: *GtkWidget) *GdkScreen;
+pub extern fn gtk_widget_set_visual(widget: *GtkWidget, visual: *GdkVisual) void;
+pub extern fn gtk_widget_set_app_paintable(widget: *GtkWidget, app_paintable: gboolean) void;
+pub extern fn gtk_widget_get_allocated_width(widget: *GtkWidget) c_int;
+pub extern fn gtk_widget_get_allocated_height(widget: *GtkWidget) c_int;
+pub extern fn gdk_screen_get_rgba_visual(screen: *GdkScreen) ?*GdkVisual;
 pub extern fn gtk_widget_set_margin_start(widget: *GtkWidget, margin: gint) void;
 pub extern fn gtk_widget_set_margin_end(widget: *GtkWidget, margin: gint) void;
 pub extern fn gtk_widget_set_margin_top(widget: *GtkWidget, margin: gint) void;
@@ -145,8 +190,14 @@ pub extern fn gtk_layer_init_for_window(window: *GtkWindow) void;
 pub extern fn gtk_layer_set_layer(window: *GtkWindow, layer: GtkLayerShellLayer) void;
 pub extern fn gtk_layer_set_anchor(window: *GtkWindow, edge: GtkLayerShellEdge, anchor_to_edge: gboolean) void;
 pub extern fn gtk_layer_set_margin(window: *GtkWindow, edge: GtkLayerShellEdge, margin_size: gint) void;
+pub extern fn gtk_layer_set_exclusive_zone(window: *GtkWindow, exclusive_zone: gint) void;
 pub extern fn gtk_layer_set_keyboard_mode(window: *GtkWindow, mode: GtkLayerShellKeyboardMode) void;
 pub extern fn gtk_layer_set_namespace(window: *GtkWindow, name_space: [*:0]const u8) void;
 
 // ---- GDK events ----
 pub extern fn gdk_event_get_keyval(event: *const GdkEvent, keyval: *guint) gboolean;
+pub extern fn gdk_event_get_coords(event: *const GdkEvent, x_win: *f64, y_win: *f64) gboolean;
+
+// ---- cairo (only to paint the probe surface fully transparent) ----
+pub extern fn cairo_set_operator(cr: *cairo_t, op: cairo_operator_t) void;
+pub extern fn cairo_paint(cr: *cairo_t) void;
