@@ -99,6 +99,25 @@ module should start showing your unread count within a few seconds
 (or immediately -- click the module, or send waybar the refresh signal:
 `pkill -x -RTMIN+9 waybar`).
 
+## Prebuilt binaries (bootc and other images)
+
+CI builds and tests both binaries against Fedora 44 and publishes them as a
+`FROM scratch` image, `ghcr.io/oshox/waybar-gmail-checker`, containing just
+the two files in `/usr/bin`. `latest` tracks `main`; every build is also
+tagged `sha-<commit>`, and `v*` git tags are published under their own name.
+To bake the binaries into another image:
+
+```dockerfile
+COPY --from=ghcr.io/oshox/waybar-gmail-checker:latest /usr/bin/waybar-gmail /usr/bin/waybar-gmail-popup /usr/bin/
+```
+
+`waybar-gmail` is static. `waybar-gmail-popup` needs Fedora 44's GTK3 and
+gtk-layer-shell, and both need `secret-tool` (libsecret), `xdg-open` and
+`pkill` at runtime. With the binaries in `/usr/bin`, the waybar module
+should use the bare command names, as in
+[`waybar/config-snippet.jsonc`](waybar/config-snippet.jsonc); a dev install
+in `~/.local/bin` (from `./install.sh`) then still takes precedence on `PATH`.
+
 ## Configuration
 
 `~/.config/waybar-gmail/config.json` (optional -- sensible defaults apply
@@ -139,9 +158,9 @@ auth`.
 Raise or lower `double_click_ms` in `~/.config/waybar-gmail/config.json`.
 
 **Popup doesn't open at all.** Check that `~/.local/bin` is on `PATH` --
-`click.zig` spawns `waybar-gmail-popup` by bare name via `PATH` lookup, so
-it needs to be findable that way even though waybar itself invokes
-`waybar-gmail` by full path. Run `waybar-gmail-popup` directly in a
+`click.zig` spawns `waybar-gmail-popup` by bare name via `PATH` lookup, and
+the waybar module snippet runs `waybar-gmail` by bare name too, so both
+need to be findable that way. Run `waybar-gmail-popup` directly in a
 terminal to see any startup error.
 
 **After an `rpm-ostree upgrade` (or similar atomic-OS update).** If you
@@ -160,6 +179,14 @@ rpm-ostree install gtk3-devel gtk-layer-shell-devel
 ```sh
 zig build test    # unit tests
 zig build         # both binaries, into zig-out/bin/
+```
+
+To reproduce what CI builds (both binaries compiled and the unit tests run
+inside a Fedora 44 container, using a throwaway keyring from
+[`ci/test.sh`](ci/test.sh)):
+
+```sh
+podman build -t waybar-gmail-checker:local .
 ```
 
 Every network call goes through a fixture-mode seam: set

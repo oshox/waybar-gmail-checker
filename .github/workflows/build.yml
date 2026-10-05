@@ -1,0 +1,56 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/waybar-gmail-checker
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Containerfile compiles both binaries against Fedora 44 and runs
+      # the unit tests, so a failing test fails this step and nothing below
+      # runs. The result is a FROM scratch image holding only the binaries.
+      - name: Build (compile + test inside a Fedora 44 container)
+        run: podman build -t "$IMAGE:build" -f Containerfile .
+
+      - name: Work out tags
+        if: github.event_name != 'pull_request'
+        id: tags
+        run: |
+          tags="sha-${GITHUB_SHA::7}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then tags="$tags latest"; fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then tags="$tags $GITHUB_REF_NAME"; fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            podman tag "$IMAGE:build" "$IMAGE:$tag"
+            podman push "$IMAGE:$tag"
+          done
+
+# One-time setup after the first successful run (not automated):
+#   github.com/oshox?tab=packages -> waybar-gmail-checker -> Package settings
+#   -> Change visibility -> Public, if it came up private. The image holds only
+#   the two binaries (no secrets), and a public image means other images'
+#   builds need no registry login to `COPY --from=` it.

@@ -5,6 +5,10 @@
 // hand-maintained (comments, specific ordering) and a script splicing
 // JSON into that blindly is more likely to mangle it than help.
 //
+// - exec/on-click/on-click-right use the bare command name, resolved via
+//   PATH, so this works whether the binaries came from install.sh
+//   (~/.local/bin) or from an image that bakes them into /usr/bin -- a
+//   dev install in ~/.local/bin simply wins on PATH.
 // - interval: how often waybar re-runs `status`. This is the ONLY thing
 //   that controls polling cadence -- there is no setting inside
 //   waybar-gmail itself for it (see src/config.zig).
@@ -19,8 +23,8 @@
   "return-type": "json",
   "interval": 60,
   "signal": 9,
-  "exec": "$HOME/.local/bin/waybar-gmail status",
-  "on-click": "$HOME/.local/bin/waybar-gmail click",
-  "on-click-right": "$HOME/.local/bin/waybar-gmail open",
+  "exec": "waybar-gmail status",
+  "on-click": "waybar-gmail click",
+  "on-click-right": "waybar-gmail open",
   "tooltip": true,
 },

@@ -47,9 +47,9 @@ case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *)
         warn "$BIN_DIR is not on your PATH."
-        warn "waybar's on-click handler runs waybar-gmail directly by full path, but"
-        warn "click.zig spawns waybar-gmail-popup by bare name via PATH lookup -- add"
-        warn "$BIN_DIR to PATH in your shell profile, or the popup won't open."
+        warn "the waybar module runs waybar-gmail, and click.zig spawns"
+        warn "waybar-gmail-popup, by bare name via PATH lookup -- add $BIN_DIR to"
+        warn "PATH in your shell profile, or the module and popup won't be found."
         ;;
 esac
 
